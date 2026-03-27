@@ -28,6 +28,7 @@
 - 2026-03-26 20:39 EDT: Removed the remaining width caps from the builder and run shells so the UI uses the full browser width instead of a centered `max-w-*` layout.
 - 2026-03-26 20:52 EDT: Simplified the run page around a single primary live board by removing duplicate milestone renderings, collapsing prompt/transcript/diagnostics behind explicit toggles, and demoting the referee summary out of the always-visible sidebar.
 - 2026-03-26 20:52 EDT: Stopped server-rendering the ticking activity timer so live status pills no longer trigger hydration mismatches while a run is in progress.
+- 2026-03-26 23:39 EDT: Replaced the OpenRouter adapter's fixed four-minute wall-clock timeout with stream-liveness timeouts: 60 seconds to first streamed activity and 30 seconds of idle time between streamed events.
 
 ## Progress
 - 2026-03-26 15:56 EDT: Created the baseline Next.js application in an empty workspace.
@@ -56,6 +57,7 @@
 - 2026-03-26 20:39 EDT: Removed `max-w-*` classes from the main builder and run-page shells plus the remaining capped header and helper copy blocks so wide monitors are fully used.
 - 2026-03-26 20:52 EDT: Reworked `RunSession` so the live lanes stay visible while prompt details, referee summary, transcript history, and diagnostics are folded into secondary panels instead of competing as equal-weight surfaces.
 - 2026-03-26 20:52 EDT: Replaced the repeated full milestone cards in the controls sidebar and referee lane with one compact top checklist plus a small referee milestone-focus card.
+- 2026-03-26 23:39 EDT: Added OpenRouter adapter tests covering first-activity timeout, post-start idle timeout, non-text activity keepalive, explicit cancellation, and long-running streams that legitimately exceed four minutes.
 
 ## Gaps
 - Active runs are process-local. If the server restarts while a run is `waiting_for_user`, the persisted transcript remains, but that in-flight run will not automatically resume.
@@ -104,3 +106,7 @@
 - 2026-03-26 20:52 EDT: `npm run test` passed after collapsing the prompt/history panels and changing the activity timer to client-only elapsed rendering.
 - 2026-03-26 20:52 EDT: `npm run lint` passed after the run-page simplification and hydration-mismatch fix.
 - 2026-03-26 20:52 EDT: `npm run build` passed after refactoring the run transcript page around collapsible secondary panels.
+- 2026-03-26 23:38 EDT: `npm run test -- tests/openrouter-provider.test.ts` passed after replacing the OpenRouter wall-clock timeout with stream-idle timeout logic.
+- 2026-03-26 23:38 EDT: `npm run test` passed with 22 tests after adding provider timeout coverage.
+- 2026-03-26 23:39 EDT: `npm run lint` passed after the OpenRouter timeout-controller refactor and test additions.
+- 2026-03-26 23:39 EDT: `npm run build` passed after switching the provider timeout behavior to first-activity plus idle-gap semantics.

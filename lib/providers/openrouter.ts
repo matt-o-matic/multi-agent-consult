@@ -14,7 +14,8 @@ import type {
 
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
-const OPENROUTER_REQUEST_TIMEOUT_MS = 4 * 60 * 1000;
+const OPENROUTER_FIRST_ACTIVITY_TIMEOUT_MS = 60 * 1000;
+const OPENROUTER_STREAM_IDLE_TIMEOUT_MS = 30 * 1000;
 
 interface OpenRouterModel {
   id: string;
@@ -235,6 +236,62 @@ function parseToolCalls(toolCalls: unknown) {
   });
 }
 
+function timeoutError(message: string) {
+  return new Error(message);
+}
+
+function createStreamTimeoutController(requestSignal?: AbortSignal) {
+  const controller = new AbortController();
+  const signal = requestSignal
+    ? AbortSignal.any([requestSignal, controller.signal])
+    : controller.signal;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let lastTimeoutError: Error | null = null;
+
+  const arm = (delayMs: number, message: string) => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+
+    timer = setTimeout(() => {
+      if (controller.signal.aborted) {
+        return;
+      }
+
+      lastTimeoutError = timeoutError(message);
+      controller.abort(lastTimeoutError);
+    }, delayMs);
+  };
+
+  arm(
+    OPENROUTER_FIRST_ACTIVITY_TIMEOUT_MS,
+    `OpenRouter completion timed out waiting for first streamed activity after ${
+      OPENROUTER_FIRST_ACTIVITY_TIMEOUT_MS / 1000
+    } seconds.`,
+  );
+
+  return {
+    dispose() {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    },
+    markActivity() {
+      arm(
+        OPENROUTER_STREAM_IDLE_TIMEOUT_MS,
+        `OpenRouter completion timed out after ${
+          OPENROUTER_STREAM_IDLE_TIMEOUT_MS / 1000
+        } seconds without streamed activity.`,
+      );
+    },
+    signal,
+    timedOut() {
+      return lastTimeoutError;
+    },
+  };
+}
+
 export class OpenRouterAdapter implements ProviderAdapter {
   readonly key = "openrouter" as const;
 
@@ -318,10 +375,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
 
   async createChatStream(request: ProviderChatRequest): Promise<ProviderChatResponse> {
     const apiKey = requireOpenRouterApiKey();
-    const timeoutSignal = AbortSignal.timeout(OPENROUTER_REQUEST_TIMEOUT_MS);
-    const signal = request.signal
-      ? AbortSignal.any([request.signal, timeoutSignal])
-      : timeoutSignal;
+    const timeoutController = createStreamTimeoutController(request.signal);
 
     try {
       const response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
@@ -356,7 +410,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
           stream: true,
         }),
         cache: "no-store",
-        signal,
+        signal: timeoutController.signal,
       });
 
       if (!response.ok) {
@@ -367,6 +421,8 @@ export class OpenRouterAdapter implements ProviderAdapter {
       }
 
       if (!response.body) {
+        timeoutController.markActivity();
+
         const payload = (await response.json()) as {
           choices?: Array<{
             message?: {
@@ -432,11 +488,13 @@ export class OpenRouterAdapter implements ProviderAdapter {
           }
 
           if (payload === "[DONE]") {
+            timeoutController.markActivity();
             isDone = true;
             break;
           }
 
           const chunk = JSON.parse(payload) as OpenRouterStreamChunk;
+          timeoutController.markActivity();
           if (chunk.error?.message) {
             throw new Error(chunk.error.message);
           }
@@ -474,19 +532,20 @@ export class OpenRouterAdapter implements ProviderAdapter {
         rawAnnotations,
       };
     } catch (error) {
-      if (timeoutSignal.aborted) {
-        throw new Error(
-          `OpenRouter completion timed out after ${OPENROUTER_REQUEST_TIMEOUT_MS / 1000} seconds.`,
-        );
-      }
-
       if (request.signal?.aborted) {
         throw request.signal.reason instanceof Error
           ? request.signal.reason
           : new Error("Run cancelled.");
       }
 
+      const timedOut = timeoutController.timedOut();
+      if (timedOut) {
+        throw timedOut;
+      }
+
       throw error;
+    } finally {
+      timeoutController.dispose();
     }
   }
 
