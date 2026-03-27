@@ -1,26 +1,247 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #f4efe4;
+  --foreground: #11221d;
+  --panel: rgba(255, 250, 238, 0.86);
+  --panel-strong: rgba(253, 246, 230, 0.94);
+  --line: rgba(17, 34, 29, 0.14);
+  --accent: #c46a2d;
+  --accent-strong: #8f3c17;
+  --mint: #0b7a67;
+  --ink-soft: rgba(17, 34, 29, 0.68);
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-display);
+  --font-mono: var(--font-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background:
+    radial-gradient(circle at top left, rgba(196, 106, 45, 0.18), transparent 34%),
+    radial-gradient(circle at top right, rgba(11, 122, 103, 0.14), transparent 30%),
+    linear-gradient(180deg, #f7f2e8 0%, #efe3cf 100%);
+  color: var(--foreground);
 }
 
 body {
-  background: var(--background);
+  background: transparent;
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-display), sans-serif;
+}
+
+a {
+  color: inherit;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+::selection {
+  background: rgba(196, 106, 45, 0.24);
+}
+
+.app-shell {
+  min-height: 100vh;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.52), transparent 44%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0));
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  box-shadow:
+    0 24px 90px rgba(17, 34, 29, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.78);
+  backdrop-filter: blur(20px);
+}
+
+.panel-strong {
+  background: var(--panel-strong);
+}
+
+.eyebrow {
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  color: var(--ink-soft);
+}
+
+.status-pill {
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.grid-lines {
+  background-image:
+    linear-gradient(rgba(17, 34, 29, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(17, 34, 29, 0.04) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+.prose-output {
+  line-height: 1.65;
+}
+
+.prose-output > :first-child {
+  margin-top: 0;
+}
+
+.prose-output > :last-child {
+  margin-bottom: 0;
+}
+
+.prose-output h1,
+.prose-output h2,
+.prose-output h3 {
+  margin-top: 1.2rem;
+  margin-bottom: 0.6rem;
+  font-weight: 700;
+}
+
+.prose-output p,
+.prose-output li {
+  margin-bottom: 0.85rem;
+}
+
+.prose-output ol,
+.prose-output ul {
+  padding-left: 1.2rem;
+}
+
+.prose-output ul {
+  list-style: disc;
+}
+
+.prose-output ol {
+  list-style: decimal;
+}
+
+.prose-output a {
+  text-decoration: underline;
+  text-decoration-color: var(--accent);
+  text-underline-offset: 0.22rem;
+}
+
+.prose-output blockquote {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  border-left: 3px solid var(--accent);
+  background: rgba(255, 255, 255, 0.56);
+  color: var(--ink-soft);
+}
+
+.prose-output :not(pre) > code {
+  padding: 0.08rem 0.35rem;
+  border-radius: 0.4rem;
+  background: rgba(17, 34, 29, 0.08);
+  font-family: var(--font-mono), monospace;
+  font-size: 0.92em;
+}
+
+.prose-output pre {
+  overflow-x: auto;
+  padding: 0.9rem;
+  border-radius: 1rem;
+  background: rgba(17, 34, 29, 0.08);
+  font-family: var(--font-mono), monospace;
+}
+
+.prose-output table {
+  width: 100%;
+  margin: 1rem 0;
+  border-collapse: collapse;
+}
+
+.prose-output th,
+.prose-output td {
+  border: 1px solid var(--line);
+  padding: 0.65rem 0.8rem;
+  text-align: left;
+}
+
+.prose-output th {
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.mono {
+  font-family: var(--font-mono), monospace;
+}
+
+.milestone-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.65rem;
+  height: 1.65rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 0.78rem;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.milestone-check-completed {
+  background: rgba(11, 122, 103, 0.14);
+  border-color: rgba(11, 122, 103, 0.32);
+  color: var(--mint);
+}
+
+.milestone-check-current {
+  background: rgba(196, 106, 45, 0.14);
+  border-color: rgba(196, 106, 45, 0.32);
+  color: var(--accent-strong);
+}
+
+.milestone-check-pending {
+  background: rgba(255, 255, 255, 0.76);
+  color: var(--ink-soft);
+}
+
+.thinking-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.thinking-orb {
+  width: 0.42rem;
+  height: 0.42rem;
+  border-radius: 999px;
+  background: var(--accent);
+  animation: thinking-pulse 1.2s ease-in-out infinite;
+}
+
+.thinking-orb:nth-child(2) {
+  animation-delay: 0.18s;
+}
+
+.thinking-orb:nth-child(3) {
+  animation-delay: 0.36s;
+}
+
+@keyframes thinking-pulse {
+  0%,
+  80%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.32;
+  }
+
+  40% {
+    transform: translateY(-0.18rem);
+    opacity: 1;
+  }
 }

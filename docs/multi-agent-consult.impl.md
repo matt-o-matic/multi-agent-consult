@@ -1,0 +1,106 @@
+# Multi-Agent Consult Implementation Log
+
+## Decisions
+- 2026-03-26 15:56 EDT: Scaffolded the project with Next.js App Router, TypeScript, Tailwind, ESLint, and `npm`.
+- 2026-03-26 15:57 EDT: Persisted the agreed delivery plan into `docs/multi-agent-consult.plan.md`.
+- 2026-03-26 16:02 EDT: Chose Drizzle + `better-sqlite3` with app-driven table initialization so the local app can boot without a manual migration step.
+- 2026-03-26 16:08 EDT: Implemented OpenRouter as a provider adapter using the live models catalog and OpenAI-compatible chat completions with tool calling.
+- 2026-03-26 16:09 EDT: Implemented web research as a first-class tool with two backends: Brave Search via API key and OpenRouter-native web search via the OpenRouter web plugin.
+- 2026-03-26 16:11 EDT: Kept workspace tooling read-only and command-scoped. `run_check` is limited to discovered safe commands instead of arbitrary shell input.
+- 2026-03-26 16:14 EDT: Implemented the referee-mediated question flow as a pause/resume state machine. Participants can only propose questions; the referee decides what the user sees.
+- 2026-03-26 16:18 EDT: Chose SSE plus full-run refetch on events for the client transcript instead of token-level streaming to keep the app simple and reliable in local mode.
+- 2026-03-26 16:51 EDT: Prepared the repository for public publishing with a project-specific README, Apache 2.0 licensing, repo-specific AGENTS guidance, and ignored local SQLite artifacts.
+- 2026-03-26 17:55 EDT: Switched model completions to streamed OpenRouter responses with coordinator-level text delta events so participant, referee, and final-synthesis output can render live in the run transcript.
+- 2026-03-26 17:55 EDT: Added failed-run retry on the same run id by rewinding incomplete artifacts to the last stable checkpoint, then resuming either the pending turn loop or the final synthesis step.
+- 2026-03-26 18:06 EDT: Tightened the referee prompt so the referee stays in a meta-evaluation role, avoids rewriting or paraphrasing drafts at length, and reserves user-facing prose for the final synthesis step only.
+- 2026-03-26 18:06 EDT: Replaced raw transcript text rendering with Markdown parsing for participant/final output and structured referee decision cards for persisted JSON referee calls.
+- 2026-03-26 19:06 EDT: Reworked run orchestration around a persisted prompt-derived task plan so the referee converges one inferred subtask at a time instead of treating the whole prompt as a single completion check.
+- 2026-03-26 19:06 EDT: Removed referee-authored final answer generation from the critical path; final output is now the selected participant draft plus referee rationale.
+- 2026-03-26 19:29 EDT: Added an explicit peer-critique stage before each referee decision so each participant sees and critiques the other's current output before the referee rules on convergence.
+- 2026-03-26 19:29 EDT: Added process-local live run state snapshots so active streaming content and stage status survive page load and refresh instead of existing only in client memory.
+- 2026-03-26 19:29 EDT: Isolated the test database from the app database to stop `vitest` runs from deleting real local run history.
+- 2026-03-26 19:51 EDT: Rebuilt the home-page builder around browser-local persisted defaults so model choices, search/workspace settings, and role instructions stick between runs while the task prompt remains intentionally ephemeral.
+- 2026-03-26 19:51 EDT: Replaced the cramped side-by-side builder layout with stacked role editors, model filtering, quick picks from recent runs, and a clearer preflight/sidebar presentation.
+- 2026-03-26 19:59 EDT: Aligned run-config validation with the runtime type contract so `workspacePath: null` is accepted when workspace access is off instead of failing the run creation request.
+- 2026-03-26 20:31 EDT: Made milestone planning a mandatory referee-only first pass and tightened the debate cycle so each cycle is proposal A, proposal B, critique A, critique B, then referee evaluation for the current milestone only.
+- 2026-03-26 20:31 EDT: Locked finalization to completed participant cycles only and rejected retrying malformed legacy failed runs that are missing a persisted planning turn or milestone list.
+- 2026-03-26 20:31 EDT: Reframed the run page around milestone status, top-level per-role output counts, and visible thinking or streaming indicators so live state is readable without digging through the transcript.
+- 2026-03-26 20:39 EDT: Removed the remaining width caps from the builder and run shells so the UI uses the full browser width instead of a centered `max-w-*` layout.
+- 2026-03-26 20:52 EDT: Simplified the run page around a single primary live board by removing duplicate milestone renderings, collapsing prompt/transcript/diagnostics behind explicit toggles, and demoting the referee summary out of the always-visible sidebar.
+- 2026-03-26 20:52 EDT: Stopped server-rendering the ticking activity timer so live status pills no longer trigger hydration mismatches while a run is in progress.
+
+## Progress
+- 2026-03-26 15:56 EDT: Created the baseline Next.js application in an empty workspace.
+- 2026-03-26 15:57 EDT: Created the implementation log and initial documentation scaffolding.
+- 2026-03-26 16:03 EDT: Added runtime dependencies, test tooling, environment contract, and repo scripts.
+- 2026-03-26 16:07 EDT: Implemented shared types, validation, SQLite schema, run persistence helpers, and the in-memory run event bus.
+- 2026-03-26 16:12 EDT: Implemented workspace file tools, web tools, model catalog loading, and the debate coordinator with referee decisions and final synthesis.
+- 2026-03-26 16:16 EDT: Added API routes for models, runs, run detail, cancellation, SSE streaming, workspace validation, and question-batch answers.
+- 2026-03-26 16:24 EDT: Replaced the starter UI with the run builder, history panel, transcript view, final consensus panel, tool activity panel, and referee question stepper.
+- 2026-03-26 16:30 EDT: Added unit tests for provider capability validation, workspace guardrails, immediate convergence, and the pause/resume clarification flow.
+- 2026-03-26 16:52 EDT: Rewrote `README.md`, updated `AGENTS.md`, added `LICENSE`, and ignored `data/` for a public GitHub push.
+- 2026-03-26 17:55 EDT: Added live turn streaming in the OpenRouter adapter, wired SSE turn delta events into the transcript UI, exposed an API retry route, and added a retry button for failed runs.
+- 2026-03-26 17:55 EDT: Added tests for streamed turn deltas and retrying a failed final synthesis from existing persisted state.
+- 2026-03-26 18:06 EDT: Added `react-markdown` and `remark-gfm`, rendered transcript/final content as Markdown, surfaced the latest referee decision in the side panel, and replaced raw referee JSON blobs with structured referee status cards.
+- 2026-03-26 18:06 EDT: Added prompt-focused tests covering referee role boundaries and final-synthesis prompt separation.
+- 2026-03-26 19:06 EDT: Added task-plan persistence on runs, task-scoped participant/referee prompts, coordinator task advancement, and participant-authored final selection.
+- 2026-03-26 19:06 EDT: Added run-page task-plan status cards and expanded coordinator tests to cover multi-task advancement and the new final-selection contract.
+- 2026-03-26 19:29 EDT: Added referee task-planning turn streaming, participant critique turns, live-status messages, and a three-lane run view for model A, model B, and the referee.
+- 2026-03-26 19:29 EDT: Replaced the raw prompt paragraph with parsed Markdown, added soft line-break support via `remark-breaks`, and added copy-as-Markdown / copy-as-HTML controls on prompt and response surfaces.
+- 2026-03-26 19:29 EDT: Routed tests to `data/test.multi-agent-consult.sqlite` via `MULTI_AGENT_CONSULT_DB_PATH` so test runs no longer clobber the main local SQLite file.
+- 2026-03-26 19:51 EDT: Added a new `Dashboard` client component that restores the broken `/` route, hydrates the model catalog client-side, persists builder defaults to `localStorage`, and lets recent runs repopulate a prior lineup with one click.
+- 2026-03-26 19:51 EDT: Added a richer builder surface with stacked role cards, model quick picks, client-side preflight validation, and optional workspace-path validation before launching a run.
+- 2026-03-26 19:59 EDT: Added a validation regression test covering `workspaceMode: "off"` with `workspacePath: null` so the builder and API stay in sync on empty-workspace payloads.
+- 2026-03-26 20:31 EDT: Tightened coordinator resume behavior so retries either continue the same milestone with referee guidance or start the next milestone fresh, instead of accidentally carrying prior-milestone state across the boundary.
+- 2026-03-26 20:31 EDT: Added milestone-first prompt wording, richer coordinator regression coverage for non-converged cycles and max-turn finalization, and a rendered run-session test for the new summary layout and thinking indicators.
+- 2026-03-26 20:39 EDT: Removed `max-w-*` classes from the main builder and run-page shells plus the remaining capped header and helper copy blocks so wide monitors are fully used.
+- 2026-03-26 20:52 EDT: Reworked `RunSession` so the live lanes stay visible while prompt details, referee summary, transcript history, and diagnostics are folded into secondary panels instead of competing as equal-weight surfaces.
+- 2026-03-26 20:52 EDT: Replaced the repeated full milestone cards in the controls sidebar and referee lane with one compact top checklist plus a small referee milestone-focus card.
+
+## Gaps
+- Active runs are process-local. If the server restarts while a run is `waiting_for_user`, the persisted transcript remains, but that in-flight run will not automatically resume.
+- Provider-native web-search support is inferred from OpenRouter metadata and enforced at validation time, but individual model/provider combinations may still fail at runtime if upstream capabilities change.
+- Final citations are aggregated from collected source records rather than model-selected per-sentence citations. The output keeps sources separated from the solution body, but it does not attempt sentence-level attribution.
+- Live streamed partial drafts are client-session state only. They are visible in the transcript while the SSE connection is active and remain on screen after a failure in that session, but they are not yet persisted as resumable draft artifacts across page reloads.
+- Structured referee UI is derived from either persisted `referee_decisions` rows or successfully parsed streamed JSON. While a referee JSON object is still incomplete mid-stream, the live card falls back to raw text until the payload becomes parseable.
+- Task plans are inferred once per run by the referee model and then persisted. The decomposition is intentionally lightweight; it does not yet expose user editing or manual override of inferred tasks.
+- Live run state remains process-local. Refreshing the page now preserves in-flight turn text while the same server process is alive, but a full server restart still clears active streaming snapshots.
+- Builder defaults are stored per browser profile in `localStorage`. They intentionally do not sync across machines or browsers, and the task prompt is excluded from that storage on purpose.
+- Legacy completed runs created before milestone planning or before critique-round enforcement remain readable, but they can still display empty milestone state because the missing historical data is not backfilled.
+
+## Blockers
+- None currently.
+
+## Verification
+- 2026-03-26 15:56 EDT: `npm create next-app@latest . -- --ts --tailwind --eslint --app --use-npm --yes --import-alias "@/*"` completed successfully.
+- 2026-03-26 16:25 EDT: `npm run lint` passed after server, route, and UI integration.
+- 2026-03-26 16:27 EDT: `npm run build` passed, confirming the Next.js production build, typecheck, and route compilation.
+- 2026-03-26 16:29 EDT: `npm run test` passed with 5 tests covering provider validation, workspace guardrails, immediate convergence, and question-batch pause/resume.
+- 2026-03-26 16:52 EDT: `git status --short` confirmed repo metadata updates and `data/` is now ignored for public publishing.
+- 2026-03-26 17:54 EDT: `npm run test` passed with 7 tests after adding streamed turn delta coverage and failed-run final-synthesis retry coverage.
+- 2026-03-26 17:54 EDT: `npm run lint` passed after the transcript streaming and retry UI changes.
+- 2026-03-26 17:55 EDT: `npm run build` passed, confirming the new retry route, streamed SSE transcript updates, and coordinator retry path compile cleanly in production mode.
+- 2026-03-26 18:06 EDT: `npm run test` passed with 10 tests after adding referee-prompt coverage.
+- 2026-03-26 18:06 EDT: `npm run lint` passed after the Markdown transcript renderer and structured referee cards were added.
+- 2026-03-26 18:06 EDT: `npm run build` passed after integrating `react-markdown`, the tightened referee prompt, and the new structured referee transcript rendering.
+- 2026-03-26 19:06 EDT: `npm run test` passed with 11 tests after switching to task-plan sequencing and participant-authored final selection.
+- 2026-03-26 19:06 EDT: `npm run lint` passed after adding persisted task-plan state and the run-page task tracker.
+- 2026-03-26 19:06 EDT: `npm run build` passed after removing referee final synthesis, adding task-plan persistence, and rendering task progress in the transcript UI.
+- 2026-03-26 19:29 EDT: `npm run test` passed with the new proposal/critique/referee cycle and the isolated test database path.
+- 2026-03-26 19:29 EDT: `npm run lint` passed after the live-lane UI, prompt renderer, and copy controls were added.
+- 2026-03-26 19:29 EDT: `npm run build` passed after adding live-state hydration, critique-phase orchestration, and test DB isolation.
+- 2026-03-26 19:51 EDT: `npm run lint` passed after restoring the home-page builder and adding local-settings persistence, model filtering, and stacked role editors.
+- 2026-03-26 19:51 EDT: `npm run build` passed after compiling the rebuilt `Dashboard` component and restoring the `/` route.
+- 2026-03-26 19:51 EDT: `npm run test` passed after the builder rewrite, confirming the existing orchestration and provider tests still hold against the updated app shell.
+- 2026-03-26 19:59 EDT: `npm run test` passed after updating `runConfigSchema` to accept `workspacePath: null` and adding a regression test for that payload.
+- 2026-03-26 19:59 EDT: `npm run lint` passed after the run-config validation fix.
+- 2026-03-26 20:29 EDT: `npm run test` passed with 16 tests after adding milestone-repeat, max-turn, legacy-retry, prompt, and run-session coverage.
+- 2026-03-26 20:29 EDT: `npm run lint` passed after the milestone-first coordinator changes and the new run summary UI.
+- 2026-03-26 20:30 EDT: `npm run build` passed after tightening coordinator invariants, retry behavior, and the run-page milestone summary cards.
+- 2026-03-26 20:31 EDT: Verified `http://localhost:3001/runs/01ddfa49-2768-42b1-a211-57373c19d2c5` in Playwright. The page rendered the new top-level milestone checklist, current milestone summary, and per-role completed-output cards against a local run with a persisted planning turn and critique cycle.
+- 2026-03-26 20:39 EDT: `npm run lint` passed after removing the builder and run-page width caps.
+- 2026-03-26 20:39 EDT: `npm run build` passed after the full-width layout update.
+- 2026-03-26 20:39 EDT: Verified `http://localhost:3001/runs/01ddfa49-2768-42b1-a211-57373c19d2c5` in Playwright again after the layout change. The run shell now renders as a full-width page instead of a centered `max-w-7xl` column.
+- 2026-03-26 20:52 EDT: `npm run test` passed after collapsing the prompt/history panels and changing the activity timer to client-only elapsed rendering.
+- 2026-03-26 20:52 EDT: `npm run lint` passed after the run-page simplification and hydration-mismatch fix.
+- 2026-03-26 20:52 EDT: `npm run build` passed after refactoring the run transcript page around collapsible secondary panels.
