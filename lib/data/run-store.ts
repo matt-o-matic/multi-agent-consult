@@ -2,6 +2,7 @@ import "server-only";
 
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 
+import { normalizeDebateMode } from "@/lib/debate-mode";
 import { db } from "@/lib/db/client";
 import {
   participants,
@@ -125,6 +126,9 @@ function toRefereeDecision(
     preferredDraft: row.preferredDraft as RefereeDecision["preferredDraft"],
     requiredNextFocus: row.requiredNextFocus,
     remainingDisagreements: row.remainingDisagreements,
+    blockingIssues: parseJson(row.blockingIssuesJson, [] as string[]),
+    carryForwardNotes: parseJson(row.carryForwardNotesJson, [] as string[]),
+    diminishingReturns: parseJson(row.diminishingReturnsJson, [] as string[]),
     needsUserInput: !!row.needsUserInput,
     questionBatch: row.questionBatchId
       ? batchLookup.get(row.questionBatchId) ?? null
@@ -151,6 +155,7 @@ function buildRunSummary(
     taskPrompt: runRow.taskPrompt,
     status: runRow.status as RunStatus,
     stopReason: (runRow.stopReason as StopReason | null) ?? null,
+    debateMode: normalizeDebateMode(runRow.debateMode as RunSummary["debateMode"] | null),
     createdAt: runRow.createdAt,
     updatedAt: runRow.updatedAt,
     participantA: toParticipantConfig(participantA),
@@ -177,7 +182,9 @@ export async function createRun(runId: string, config: RunConfig) {
     taskPlanJson: null,
     status: "queued",
     maxTurns: config.maxTurns,
+    debateMode: normalizeDebateMode(config.debateMode),
     currentTurn: 0,
+    currentMilestoneTurn: 0,
     currentTaskIndex: 0,
     searchBackend: config.searchBackend,
     workspaceMode: config.workspaceMode,
@@ -273,6 +280,7 @@ export async function getRunDetail(runId: string) {
     searchBackend: runRow.searchBackend as RunDetail["searchBackend"],
     workspacePath: runRow.workspacePath,
     currentTurn: runRow.currentTurn,
+    currentMilestoneTurn: runRow.currentMilestoneTurn,
     currentTaskIndex: runRow.currentTaskIndex,
     taskPlan: parseJson(runRow.taskPlanJson, [] as DebateTask[]),
     errorText: runRow.errorText,
@@ -302,6 +310,7 @@ export async function updateRunStatus(
     stopReason?: StopReason | null;
     errorText?: string | null;
     currentTurn?: number;
+    currentMilestoneTurn?: number;
     currentTaskIndex?: number;
     activeQuestionBatchId?: string | null;
   } = {},
@@ -315,6 +324,7 @@ export async function updateRunStatus(
       stopReason: options.stopReason ?? undefined,
       errorText: options.errorText ?? undefined,
       currentTurn: options.currentTurn ?? undefined,
+      currentMilestoneTurn: options.currentMilestoneTurn ?? undefined,
       currentTaskIndex: options.currentTaskIndex ?? undefined,
       activeQuestionBatchId: options.activeQuestionBatchId ?? undefined,
       updatedAt: now,
@@ -365,6 +375,7 @@ export async function prepareRunForRetry(
   options: {
     activeQuestionBatchId?: string | null;
     currentTurn: number;
+    currentMilestoneTurn?: number;
     currentTaskIndex?: number;
   },
 ) {
@@ -377,6 +388,7 @@ export async function prepareRunForRetry(
       stopReason: null,
       errorText: null,
       currentTurn: options.currentTurn,
+      currentMilestoneTurn: options.currentMilestoneTurn ?? 0,
       currentTaskIndex: options.currentTaskIndex ?? 0,
       activeQuestionBatchId: options.activeQuestionBatchId ?? null,
       finalSolution: null,
@@ -451,6 +463,9 @@ export async function recordRefereeDecision(decision: RefereeDecision) {
     preferredDraft: decision.preferredDraft,
     requiredNextFocus: decision.requiredNextFocus,
     remainingDisagreements: decision.remainingDisagreements,
+    blockingIssuesJson: JSON.stringify(decision.blockingIssues ?? []),
+    carryForwardNotesJson: JSON.stringify(decision.carryForwardNotes ?? []),
+    diminishingReturnsJson: JSON.stringify(decision.diminishingReturns ?? []),
     needsUserInput: decision.needsUserInput,
     questionBatchId: decision.questionBatch?.id ?? null,
     createdAt: decision.createdAt,

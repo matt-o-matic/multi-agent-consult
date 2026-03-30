@@ -49,9 +49,13 @@ class RunLiveStateStore {
       state.activeTurns.set(
         liveTurnKey(event),
         {
+          attempt: event.attempt,
           content: "",
+          lastError: null,
+          maxAttempts: event.maxAttempts,
           modelId: event.modelId,
           phase: event.phase,
+          retryDelayMs: null,
           role: event.role,
           startedAt: event.at,
           turnIndex: event.turnIndex,
@@ -65,15 +69,45 @@ class RunLiveStateStore {
       state.activeTurns.set(
         liveTurnKey(event),
         {
+          attempt: event.attempt,
           content: event.content,
+          lastError: null,
+          maxAttempts: event.maxAttempts,
           modelId: event.modelId,
           phase: event.phase,
           role: event.role,
           startedAt: state.activeTurns.get(liveTurnKey(event))?.startedAt ?? event.at,
+          retryDelayMs: null,
           turnIndex: event.turnIndex,
           updatedAt: event.at,
         },
       );
+      return;
+    }
+
+    if (event.type === "turn_retrying") {
+      const key = liveTurnKey(event);
+      const existing = state.activeTurns.get(key);
+      state.activeTurns.set(key, {
+        attempt: event.attempt,
+        content: "",
+        lastError: event.lastError,
+        maxAttempts: event.maxAttempts,
+        modelId: event.modelId,
+        phase: event.phase,
+        retryDelayMs: event.retryDelayMs,
+        role: event.role,
+        startedAt: event.at,
+        turnIndex: event.turnIndex,
+        updatedAt: event.at,
+      });
+
+      if (existing?.content) {
+        state.activeTurns.set(key, {
+          ...state.activeTurns.get(key)!,
+          content: "",
+        });
+      }
       return;
     }
 

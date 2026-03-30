@@ -1,6 +1,7 @@
 export type ProviderKey = "openrouter";
 export type SearchBackend = "off" | "provider_native" | "brave";
 export type WorkspaceMode = "off" | "path";
+export type DebateMode = "collaborative_debate" | "writers_room";
 export type ParticipantRole = "participant_a" | "participant_b";
 export type ActorRole = ParticipantRole | "referee";
 export type RunStatus =
@@ -54,6 +55,7 @@ export interface ParticipantConfig {
 export interface RunConfig {
   taskPrompt: string;
   maxTurns: number;
+  debateMode?: DebateMode;
   searchBackend: SearchBackend;
   workspaceMode: WorkspaceMode;
   workspacePath?: string | null;
@@ -153,6 +155,24 @@ export interface DebateTask {
   completionCriteria: string;
 }
 
+export interface EvidencePacketItem {
+  title: string;
+  domain: string;
+  url: string;
+  snippet?: string;
+  toolName?: string;
+}
+
+export interface EvidencePacket {
+  gatheredBy: ParticipantRole;
+  turnId: string;
+  turnIndex: number;
+  phase: TurnPhase;
+  toolNames: string[];
+  extractedNotes: string[];
+  items: EvidencePacketItem[];
+}
+
 export interface UserQuestionBatch {
   id: string;
   runId: string;
@@ -173,6 +193,9 @@ export interface RefereeDecision {
   preferredDraft: ParticipantRole | "tie";
   requiredNextFocus: string;
   remainingDisagreements: string;
+  blockingIssues?: string[];
+  carryForwardNotes?: string[];
+  diminishingReturns?: string[];
   needsUserInput: boolean;
   questionBatch?: UserQuestionBatch | null;
   createdAt: string;
@@ -185,9 +208,13 @@ export interface FinalConsensus {
 }
 
 export interface LiveTurnState {
+  attempt?: number;
   content: string;
+  lastError?: string | null;
+  maxAttempts?: number;
   modelId: string;
   phase: TurnPhase;
+  retryDelayMs?: number | null;
   role: ActorRole;
   startedAt: string;
   turnIndex: number;
@@ -205,6 +232,7 @@ export interface RunSummary {
   taskPrompt: string;
   status: RunStatus;
   stopReason?: StopReason | null;
+  debateMode: DebateMode;
   createdAt: string;
   updatedAt: string;
   participantA: ParticipantConfig;
@@ -217,6 +245,7 @@ export interface RunDetail extends RunSummary {
   searchBackend: SearchBackend;
   workspacePath?: string | null;
   currentTurn: number;
+  currentMilestoneTurn: number;
   currentTaskIndex: number;
   taskPlan: DebateTask[];
   liveState?: RunLiveState | null;
@@ -242,6 +271,8 @@ export type RunEvent =
   | {
       type: "turn_started";
       runId: string;
+      attempt: number;
+      maxAttempts: number;
       role: ActorRole;
       phase: TurnPhase;
       turnIndex: number;
@@ -251,12 +282,27 @@ export type RunEvent =
   | {
       type: "turn_delta";
       runId: string;
+      attempt: number;
+      maxAttempts: number;
       role: ActorRole;
       phase: TurnPhase;
       turnIndex: number;
       modelId: string;
       delta: string;
       content: string;
+      at: string;
+    }
+  | {
+      type: "turn_retrying";
+      runId: string;
+      attempt: number;
+      lastError: string;
+      maxAttempts: number;
+      modelId: string;
+      phase: TurnPhase;
+      retryDelayMs: number;
+      role: ActorRole;
+      turnIndex: number;
       at: string;
     }
   | {

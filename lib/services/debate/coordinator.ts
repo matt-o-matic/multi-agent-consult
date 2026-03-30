@@ -3,26 +3,37 @@ import "server-only";
 import { z } from "zod";
 
 import {
+  getDebateRoleLabel,
+  getOtherParticipantRole,
+  normalizeDebateMode,
+} from "@/lib/debate-mode";
+import {
   recordRefereeDecision,
   recordSourceRecords,
   recordToolInvocation,
   recordTurn,
   saveFinalConsensus,
-  saveTaskPlan,
   saveQuestionBatch,
+  saveTaskPlan,
   updateRunStatus,
 } from "@/lib/data/run-store";
-import type { ProviderMessage } from "@/lib/providers/base";
+import type {
+  ProviderMessage,
+} from "@/lib/providers/base";
 import type { ProviderAdapter } from "@/lib/providers/base";
 import {
+  buildParticipantCritiqueUserPrompt,
   buildParticipantSystemPrompt,
   buildParticipantUserPrompt,
-  buildParticipantCritiqueUserPrompt,
   buildRefereeSystemPrompt,
   buildRefereeUserPrompt,
   buildTaskPlanSystemPrompt,
   buildTaskPlanUserPrompt,
 } from "@/lib/services/debate/prompts";
+import {
+  executeChatWithRetry,
+  RetryableStructuredOutputError,
+} from "@/lib/services/chat-retry";
 import { runEventBus } from "@/lib/services/event-bus";
 import { runLiveStateStore } from "@/lib/services/live-state";
 import {
@@ -31,20 +42,100 @@ import {
 } from "@/lib/services/tool-broker";
 import type {
   ActorRole,
+  DebateMode,
   DebateTask,
+  EvidencePacket,
   FinalConsensus,
   ParticipantRole,
   RefereeDecision,
-  RunEvent,
-  RunDetail,
   RunConfig,
+  RunDetail,
+  RunEvent,
   SourceRecord,
   ToolInvocationRecord,
+  TurnPhase,
   TurnRecord,
   UserQuestionBatch,
   UserQuestionProposal,
   WorkspaceManifest,
 } from "@/lib/types";
+
+const questionOptionPayloadSchema = z.union([
+  z.string().trim().min(1),
+  z
+    .object({
+      id: z.string().trim().min(1).optional(),
+      label: z.string().trim().min(1).optional(),
+      description: z.string().trim().min(1).optional(),
+      recommended: z.boolean().optional(),
+    })
+    .refine(
+      (value) =>
+        Boolean(value.id?.trim() || value.label?.trim() || value.description?.trim()),
+      {
+        message:
+          "Question option objects must include at least one of id, label, or description.",
+      },
+    ),
+]);
+
+function normalizeQuestionPromptText(value: unknown) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+
+  return undefined;
+}
+
+function normalizeQuestionPayload(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+
+  const record = value as Record<string, unknown>;
+  return {
+    ...record,
+    question:
+      normalizeQuestionPromptText(record.question) ??
+      normalizeQuestionPromptText(record.prompt) ??
+      normalizeQuestionPromptText(record.title) ??
+      normalizeQuestionPromptText(record.header) ??
+      normalizeQuestionPromptText(record.text),
+  };
+}
+
+const questionPayloadSchema = z.preprocess(
+  normalizeQuestionPayload,
+  z.object({
+    id: z.string().trim().min(1).optional(),
+    question: z.string().trim().min(1),
+    notePlaceholder: z.string().trim().min(1).optional(),
+    options: z.array(questionOptionPayloadSchema).min(2),
+  }),
+);
+
+const questionBatchPayloadSchema = z.object({
+  questions: z.array(questionPayloadSchema).min(1),
+});
+
+const taskDefinitionSchema = z.object({
+  title: z.string().min(1),
+  objective: z.string().min(1),
+  completionCriteria: z.string().min(1),
+});
+
+const planningResponseSchema = z.discriminatedUnion("outcome", [
+  z.object({
+    outcome: z.literal("tasks"),
+    tasks: z.array(taskDefinitionSchema).min(1).max(5),
+  }),
+  z.object({
+    outcome: z.literal("question_batch"),
+    summary: z.string().min(1),
+    questionBatch: questionBatchPayloadSchema,
+  }),
+]);
 
 const refereeDecisionSchema = z.object({
   converged: z.boolean(),
@@ -53,65 +144,33 @@ const refereeDecisionSchema = z.object({
   preferredDraft: z.enum(["participant_a", "participant_b", "tie"]),
   requiredNextFocus: z.string().min(1),
   remainingDisagreements: z.string().min(1),
+  blockingIssues: z.array(z.string().min(1)).optional(),
+  carryForwardNotes: z.array(z.string().min(1)).optional(),
+  diminishingReturns: z.array(z.string().min(1)).optional(),
   needsUserInput: z.boolean(),
-  questionBatch: z
-    .object({
-      questions: z
-        .array(
-          z.object({
-            id: z.string().min(1).optional(),
-            question: z.string().min(1),
-            notePlaceholder: z.string().optional(),
-            options: z
-              .array(
-                z.object({
-                  id: z.string().min(1),
-                  label: z.string().min(1),
-                  description: z.string().min(1),
-                  recommended: z.boolean().optional(),
-                }),
-              )
-              .min(2)
-              .max(4),
-          }),
-        )
-        .min(1)
-        .max(3),
-  })
-    .optional(),
-});
-
-const taskPlanSchema = z.object({
-  tasks: z
-    .array(
-      z.object({
-        title: z.string().min(1),
-        objective: z.string().min(1),
-        completionCriteria: z.string().min(1),
-      }),
-    )
-    .min(1)
-    .max(5),
+  questionBatch: questionBatchPayloadSchema.optional(),
 });
 
 interface ParticipantTurnResult {
+  evidencePacket?: EvidencePacket | null;
   turn: TurnRecord;
   toolInvocations: ToolInvocationRecord[];
   sources: SourceRecord[];
   questionProposals: UserQuestionProposal[];
 }
 
+type ParticipantResultMap = Partial<Record<ParticipantRole, ParticipantTurnResult>>;
+
 interface RunCheckpoint {
   taskPlan: DebateTask[];
   currentTaskIndex: number;
+  currentMilestoneTurn: number;
   answeredQuestionBatches: UserQuestionBatch[];
+  carryForwardNotes: string[];
   collectedSources: SourceRecord[];
-  latestA: ParticipantTurnResult | null;
-  latestB: ParticipantTurnResult | null;
-  latestCritiqueA: ParticipantTurnResult | null;
-  latestCritiqueB: ParticipantTurnResult | null;
+  latestDrafts: ParticipantResultMap;
+  latestCritiques: ParticipantResultMap;
   previousDecision: RefereeDecision | null;
-  refereeDecisions: RefereeDecision[];
   startTurnIndex: number;
 }
 
@@ -121,6 +180,40 @@ interface ExecuteRunArgs {
   workspaceManifest?: WorkspaceManifest | null;
   signal: AbortSignal;
   waitForAnswers: (batch: UserQuestionBatch, signal: AbortSignal) => Promise<UserQuestionBatch>;
+}
+
+interface DebateModeDefinition {
+  critiqueRoles: ParticipantRole[];
+  draftRoles: ParticipantRole[];
+  finalDraftRoles: ParticipantRole[];
+  id: DebateMode;
+  parallelCritiques: boolean;
+  parallelDrafts: boolean;
+}
+
+const PARTICIPANT_MAX_TOOL_EXCHANGES = 64;
+
+const debateModeRegistry: Record<DebateMode, DebateModeDefinition> = {
+  collaborative_debate: {
+    critiqueRoles: ["participant_a", "participant_b"],
+    draftRoles: ["participant_a", "participant_b"],
+    finalDraftRoles: ["participant_a", "participant_b"],
+    id: "collaborative_debate",
+    parallelCritiques: true,
+    parallelDrafts: true,
+  },
+  writers_room: {
+    critiqueRoles: ["participant_b"],
+    draftRoles: ["participant_a"],
+    finalDraftRoles: ["participant_a"],
+    id: "writers_room",
+    parallelCritiques: false,
+    parallelDrafts: false,
+  },
+};
+
+function getModeDefinition(mode?: DebateMode | null) {
+  return debateModeRegistry[normalizeDebateMode(mode)];
 }
 
 function isoNow() {
@@ -153,10 +246,33 @@ function publish(runId: string, event: RunEventWithoutId) {
   runEventBus.publish(fullEvent);
 }
 
-function publishTurnDelta(args: {
-  runId: string;
+function publishTurnStarted(args: {
+  attempt: number;
+  maxAttempts: number;
+  modelId: string;
+  phase: TurnPhase;
   role: ActorRole;
-  phase: TurnRecord["phase"];
+  runId: string;
+  turnIndex: number;
+}) {
+  publish(args.runId, {
+    type: "turn_started",
+    attempt: args.attempt,
+    maxAttempts: args.maxAttempts,
+    role: args.role,
+    phase: args.phase,
+    turnIndex: args.turnIndex,
+    modelId: args.modelId,
+    at: isoNow(),
+  });
+}
+
+function publishTurnDelta(args: {
+  attempt: number;
+  runId: string;
+  maxAttempts: number;
+  role: ActorRole;
+  phase: TurnPhase;
   turnIndex: number;
   modelId: string;
   delta: string;
@@ -164,6 +280,8 @@ function publishTurnDelta(args: {
 }) {
   publish(args.runId, {
     type: "turn_delta",
+    attempt: args.attempt,
+    maxAttempts: args.maxAttempts,
     role: args.role,
     phase: args.phase,
     turnIndex: args.turnIndex,
@@ -172,6 +290,106 @@ function publishTurnDelta(args: {
     content: args.content,
     at: isoNow(),
   });
+}
+
+function publishTurnRetrying(args: {
+  attempt: number;
+  lastError: string;
+  maxAttempts: number;
+  modelId: string;
+  phase: TurnPhase;
+  retryDelayMs: number;
+  role: ActorRole;
+  runId: string;
+  turnIndex: number;
+}) {
+  publish(args.runId, {
+    type: "turn_retrying",
+    attempt: args.attempt,
+    lastError: args.lastError,
+    maxAttempts: args.maxAttempts,
+    modelId: args.modelId,
+    phase: args.phase,
+    retryDelayMs: args.retryDelayMs,
+    role: args.role,
+    turnIndex: args.turnIndex,
+    at: isoNow(),
+  });
+}
+
+function formatStructuredOutputError(error: unknown) {
+  if (error instanceof z.ZodError) {
+    return error.issues
+      .slice(0, 3)
+      .map((issue) => {
+        const path = issue.path.length > 0 ? issue.path.join(".") : "root";
+        return `${path}: ${issue.message}`;
+      })
+      .join("; ");
+  }
+
+  return error instanceof Error ? error.message : "The model returned invalid structured output.";
+}
+
+function limitRepairOutput(value: string, maxLength = 4_000) {
+  const trimmed = value.trim();
+  if (trimmed.length <= maxLength) {
+    return trimmed;
+  }
+
+  return `${trimmed.slice(0, maxLength - 3).trimEnd()}...`;
+}
+
+function buildStructuredRepairMessages(args: {
+  invalidOutput: string;
+  messages: ProviderMessage[];
+  validationError: string;
+}) {
+  return [
+    ...args.messages,
+    {
+      role: "assistant" as const,
+      content: limitRepairOutput(args.invalidOutput) || "(empty response)",
+    },
+    {
+      role: "user" as const,
+      content: [
+        "Your previous response could not be parsed as valid JSON for this step.",
+        `Validation problem: ${args.validationError}`,
+        "Return corrected JSON only.",
+        "Do not include markdown fences, commentary, or any prose outside the JSON object.",
+      ].join("\n"),
+    },
+  ];
+}
+
+function buildRetryStatusMessage(args: {
+  attempt: number;
+  label: string;
+  lastError: string;
+  maxAttempts: number;
+  retryDelayMs: number;
+}) {
+  const delaySeconds = Math.max(0, Math.ceil(args.retryDelayMs / 1000));
+  const retryDelayLabel =
+    delaySeconds > 0 ? ` in ${delaySeconds}s` : "";
+
+  return `${args.label} attempt ${args.attempt - 1} failed: ${args.lastError} Retrying attempt ${args.attempt} of ${args.maxAttempts}${retryDelayLabel}.`;
+}
+
+function formatPhaseName(phase: TurnPhase) {
+  switch (phase) {
+    case "referee":
+      return "evaluation";
+    case "planning":
+    case "proposal":
+    case "revision":
+    case "critique":
+    case "final":
+      return phase;
+    default:
+      return phase;
+  }
 }
 
 function dedupeSources(sources: SourceRecord[]) {
@@ -186,8 +404,32 @@ function dedupeSources(sources: SourceRecord[]) {
   });
 }
 
+function dedupeEvidencePackets(
+  packets: Array<EvidencePacket | null | undefined>,
+): EvidencePacket[] {
+  const seen = new Set<string>();
+  const unique: EvidencePacket[] = [];
+
+  for (const packet of packets) {
+    if (!packet) {
+      continue;
+    }
+
+    const key = `${packet.gatheredBy}:${packet.turnId}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    unique.push(packet);
+  }
+
+  return unique;
+}
+
 function toParticipantTurnResult(turn: TurnRecord): ParticipantTurnResult {
   return {
+    evidencePacket: null,
     turn,
     toolInvocations: [],
     sources: [],
@@ -195,8 +437,149 @@ function toParticipantTurnResult(turn: TurnRecord): ParticipantTurnResult {
   };
 }
 
-function createQuestionBatch(runId: string, questions: z.infer<typeof refereeDecisionSchema>["questionBatch"]) {
-  if (!questions) {
+function truncateEvidenceText(value: string, maxLength = 280) {
+  const trimmed = value.trim().replace(/\s+/g, " ");
+  if (trimmed.length <= maxLength) {
+    return trimmed;
+  }
+
+  return `${trimmed.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function parseJsonValue(value: string | null | undefined) {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function collectEvidenceNotes(value: unknown, notes: string[], depth = 0) {
+  if (notes.length >= 6 || depth > 2 || value == null) {
+    return;
+  }
+
+  if (typeof value === "string") {
+    const text = truncateEvidenceText(value);
+    if (text.length > 0 && !notes.includes(text)) {
+      notes.push(text);
+    }
+    return;
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value.slice(0, 5)) {
+      collectEvidenceNotes(entry, notes, depth + 1);
+      if (notes.length >= 6) {
+        return;
+      }
+    }
+    return;
+  }
+
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const preferredKeys = ["summary", "snippet", "content", "title", "result", "results", "matches"];
+    for (const key of preferredKeys) {
+      if (key in record) {
+        collectEvidenceNotes(record[key], notes, depth + 1);
+        if (notes.length >= 6) {
+          return;
+        }
+      }
+    }
+
+    for (const [key, entry] of Object.entries(record)) {
+      if (
+        preferredKeys.includes(key) ||
+        key === "url" ||
+        key === "id" ||
+        key === "recommended" ||
+        key === "description" ||
+        key === "label"
+      ) {
+        continue;
+      }
+
+      collectEvidenceNotes(entry, notes, depth + 1);
+      if (notes.length >= 6) {
+        return;
+      }
+    }
+  }
+}
+
+function buildEvidencePacket(args: {
+  role: ParticipantRole;
+  turn: TurnRecord;
+  toolInvocations: ToolInvocationRecord[];
+  sources: SourceRecord[];
+}): EvidencePacket | null {
+  const relevantTools = args.toolInvocations.filter(
+    (tool) => tool.status === "success" && tool.toolName !== "propose_user_questions",
+  );
+  const relevantSources = dedupeSources(args.sources);
+
+  if (relevantTools.length === 0 && relevantSources.length === 0) {
+    return null;
+  }
+
+  const notes: string[] = [];
+  for (const tool of relevantTools) {
+    collectEvidenceNotes(parseJsonValue(tool.outputJson), notes);
+    if (notes.length >= 6) {
+      break;
+    }
+  }
+
+  const toolNameByInvocationId = new Map(
+    relevantTools.map((tool) => [tool.id, tool.toolName] as const),
+  );
+
+  return {
+    gatheredBy: args.role,
+    turnId: args.turn.id,
+    turnIndex: args.turn.turnIndex,
+    phase: args.turn.phase,
+    toolNames: [...new Set(relevantTools.map((tool) => tool.toolName))],
+    extractedNotes: notes,
+    items: relevantSources.map((source) => ({
+      title: source.title,
+      domain: source.domain,
+      url: source.url,
+      snippet: source.snippet,
+      toolName: source.toolInvocationId
+        ? toolNameByInvocationId.get(source.toolInvocationId)
+        : undefined,
+    })),
+  };
+}
+
+function buildTurnArtifactsByTurnId<T extends { turnId: string }>(items: T[]) {
+  const map = new Map<string, T[]>();
+
+  for (const item of items) {
+    const existing = map.get(item.turnId) ?? [];
+    existing.push(item);
+    map.set(item.turnId, existing);
+  }
+
+  return map;
+}
+
+function createQuestionBatch(
+  runId: string,
+  payload: z.infer<typeof questionBatchPayloadSchema> | undefined,
+) {
+  if (!payload) {
     return null;
   }
 
@@ -204,16 +587,13 @@ function createQuestionBatch(runId: string, questions: z.infer<typeof refereeDec
     id: crypto.randomUUID(),
     runId,
     status: "pending" as const,
-    questions: questions.questions.map((question) => ({
+    questions: payload.questions.map((question) => ({
       id: question.id ?? crypto.randomUUID(),
       question: question.question,
       notePlaceholder:
         question.notePlaceholder ??
         "Add optional context or constraints for this answer.",
-      options: question.options.map((option) => ({
-        ...option,
-        recommended: option.recommended ?? false,
-      })),
+      options: normalizeQuestionOptions(question.options),
     })),
     answers: null,
     createdAt: isoNow(),
@@ -221,7 +601,67 @@ function createQuestionBatch(runId: string, questions: z.infer<typeof refereeDec
   };
 }
 
-function toTaskPlan(tasks: z.infer<typeof taskPlanSchema>["tasks"]): DebateTask[] {
+function slugifyQuestionOptionId(value: string, fallback: string) {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return normalized || fallback;
+}
+
+function normalizeQuestionOption(
+  option: z.infer<typeof questionOptionPayloadSchema>,
+  index: number,
+) {
+  if (typeof option === "string") {
+    const label = option.trim();
+    return {
+      id: slugifyQuestionOptionId(label, `option-${index + 1}`),
+      label,
+      description: label,
+      recommended: false,
+    };
+  }
+
+  const label =
+    option.label?.trim() || option.description?.trim() || option.id?.trim() || `Option ${index + 1}`;
+  const description = option.description?.trim() || label;
+
+  return {
+    id: slugifyQuestionOptionId(option.id?.trim() || label, `option-${index + 1}`),
+    label,
+    description,
+    recommended: option.recommended ?? false,
+  };
+}
+
+function normalizeQuestionOptions(
+  options: Array<z.infer<typeof questionOptionPayloadSchema>>,
+) {
+  const usedIds = new Set<string>();
+
+  return options.map((option, index) => {
+    const normalized = normalizeQuestionOption(option, index);
+    let uniqueId = normalized.id;
+    let suffix = 2;
+
+    while (usedIds.has(uniqueId)) {
+      uniqueId = `${normalized.id}-${suffix}`;
+      suffix += 1;
+    }
+
+    usedIds.add(uniqueId);
+
+    return {
+      ...normalized,
+      id: uniqueId,
+    };
+  });
+}
+
+function toTaskPlan(tasks: Array<z.infer<typeof taskDefinitionSchema>>) {
   return tasks.map((task) => ({
     id: crypto.randomUUID(),
     title: task.title.trim(),
@@ -259,33 +699,10 @@ function decisionRequestsAnotherPass(decision: RefereeDecision) {
   );
 }
 
-function normalizeDraft(content: string) {
-  return content.replace(/\s+/g, " ").trim();
-}
-
-function pickPreferredTurn(args: {
-  participantATurn: TurnRecord;
-  participantBTurn: TurnRecord;
-  preferredDraft: RefereeDecision["preferredDraft"];
-}) {
-  if (args.preferredDraft === "participant_b") {
-    return args.participantBTurn;
-  }
-
-  if (args.preferredDraft === "participant_a") {
-    return args.participantATurn;
-  }
-
-  return normalizeDraft(args.participantATurn.content) ===
-    normalizeDraft(args.participantBTurn.content)
-    ? args.participantATurn
-    : null;
-}
-
 function buildSelectionRationale(args: {
   finalDecision: RefereeDecision;
-  taskPlan: DebateTask[];
   selectedTurn: TurnRecord;
+  taskPlan: DebateTask[];
   usedTieFallback?: boolean;
 }) {
   const completedTasks = args.taskPlan
@@ -295,7 +712,7 @@ function buildSelectionRationale(args: {
   return [
     `Selected final draft: ${args.selectedTurn.role} (${args.selectedTurn.modelId}).`,
     args.usedTieFallback
-      ? "The referee left the final preference as a tie, so the coordinator used participant A as the canonical final draft."
+      ? "The referee left the final preference unresolved, so the coordinator used the canonical participant draft for this mode."
       : null,
     "",
     `Referee summary: ${args.finalDecision.summary}`,
@@ -306,15 +723,26 @@ function buildSelectionRationale(args: {
     .join("\n");
 }
 
+function latestTurnByPhases(
+  turns: TurnRecord[],
+  role: ParticipantRole,
+  phases: TurnPhase[],
+) {
+  return [...turns]
+    .filter((turn) => turn.role === role && phases.includes(turn.phase))
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+    .at(-1) ?? null;
+}
+
 function assertCompletedCycle(args: {
+  debateMode: DebateMode;
   currentTaskIndex: number;
   finalDecision: RefereeDecision | null;
-  participantATurn: TurnRecord | null;
-  participantBTurn: TurnRecord | null;
-  participantACritique: TurnRecord | null;
-  participantBCritique: TurnRecord | null;
+  latestCritiques: ParticipantResultMap;
+  latestDrafts: ParticipantResultMap;
   taskPlan: DebateTask[];
 }) {
+  const mode = getModeDefinition(args.debateMode);
   assertMilestonePlan(args.taskPlan);
 
   if (!getCurrentTask(args.taskPlan, args.currentTaskIndex)) {
@@ -325,32 +753,147 @@ function assertCompletedCycle(args: {
     throw new Error("A referee decision is required before finalization.");
   }
 
-  if (
-    !args.participantATurn ||
-    !args.participantBTurn ||
-    !["proposal", "revision"].includes(args.participantATurn.phase) ||
-    !["proposal", "revision"].includes(args.participantBTurn.phase)
-  ) {
-    throw new Error("Finalization requires completed participant proposal or revision outputs.");
+  for (const role of mode.draftRoles) {
+    const turn = args.latestDrafts[role]?.turn ?? null;
+    if (!turn || !["proposal", "revision"].includes(turn.phase)) {
+      throw new Error(
+        `${getDebateRoleLabel(mode.id, role)} is missing the completed draft or revision output for finalization.`,
+      );
+    }
+    if (turn.turnIndex !== args.finalDecision.turnIndex) {
+      throw new Error("Finalization requires participant draft outputs from the same completed cycle as the referee decision.");
+    }
   }
 
-  if (
-    !args.participantACritique ||
-    !args.participantBCritique ||
-    args.participantACritique.phase !== "critique" ||
-    args.participantBCritique.phase !== "critique"
-  ) {
-    throw new Error("Finalization requires both participant critiques for the completed cycle.");
+  for (const role of mode.critiqueRoles) {
+    const turn = args.latestCritiques[role]?.turn ?? null;
+    if (!turn || turn.phase !== "critique") {
+      throw new Error(
+        `${getDebateRoleLabel(mode.id, role)} is missing the completed critique output for finalization.`,
+      );
+    }
+    if (turn.turnIndex !== args.finalDecision.turnIndex) {
+      throw new Error("Finalization requires critique outputs from the same completed cycle as the referee decision.");
+    }
+  }
+}
+
+function assertFinalMilestoneForFinalization(
+  taskPlan: DebateTask[],
+  currentTaskIndex: number,
+) {
+  assertMilestonePlan(taskPlan);
+
+  const finalTaskIndex = taskPlan.length - 1;
+  if (currentTaskIndex < 0 || currentTaskIndex > finalTaskIndex) {
+    throw new Error("No current milestone is available for finalization.");
   }
 
-  const completedTurnIndex = args.finalDecision.turnIndex;
-  if (
-    args.participantATurn.turnIndex !== completedTurnIndex ||
-    args.participantBTurn.turnIndex !== completedTurnIndex ||
-    args.participantACritique.turnIndex !== completedTurnIndex ||
-    args.participantBCritique.turnIndex !== completedTurnIndex
-  ) {
-    throw new Error("Finalization requires proposal, critique, and referee outputs from the same cycle.");
+  if (currentTaskIndex !== finalTaskIndex) {
+    throw new Error(
+      `Cannot finalize before the final milestone. Current milestone ${currentTaskIndex + 1} of ${taskPlan.length}.`,
+    );
+  }
+}
+
+function selectFinalTurn(args: {
+  debateMode: DebateMode;
+  finalDecision: RefereeDecision;
+  latestDrafts: ParticipantResultMap;
+}) {
+  const mode = getModeDefinition(args.debateMode);
+  const draftA = args.latestDrafts.participant_a?.turn ?? null;
+  const draftB = args.latestDrafts.participant_b?.turn ?? null;
+
+  if (!draftA) {
+    throw new Error("Participant A draft is required for final selection.");
+  }
+
+  if (mode.id === "writers_room") {
+    if (args.finalDecision.preferredDraft === "participant_b") {
+      throw new Error("The editor cannot be selected as the final draft author in writer's room mode.");
+    }
+
+    return {
+      selectedTurn: draftA,
+      usedTieFallback: args.finalDecision.preferredDraft !== "participant_a",
+    };
+  }
+
+  if (!draftB) {
+    throw new Error("Participant B draft is required for collaborative final selection.");
+  }
+
+  if (args.finalDecision.preferredDraft === "participant_b") {
+    return {
+      selectedTurn: draftB,
+      usedTieFallback: false,
+    };
+  }
+
+  if (args.finalDecision.preferredDraft === "participant_a") {
+    return {
+      selectedTurn: draftA,
+      usedTieFallback: false,
+    };
+  }
+
+  return {
+    selectedTurn: draftA,
+    usedTieFallback: true,
+  };
+}
+
+function buildCycleLabel(currentMilestoneTurn: number, maxTurns: number) {
+  return `Cycle ${currentMilestoneTurn + 1} of ${maxTurns}`;
+}
+
+function buildDraftStatusMessage(
+  mode: DebateMode,
+  currentTaskIndex: number,
+  currentMilestoneTurn: number,
+  maxTurns: number,
+  task: DebateTask,
+) {
+  if (getModeDefinition(mode).id === "writers_room") {
+    return `Writer is drafting milestone ${currentTaskIndex + 1}: ${task.title}. ${buildCycleLabel(currentMilestoneTurn, maxTurns)}.`;
+  }
+
+  return `Participants are drafting milestone ${currentTaskIndex + 1}: ${task.title}. ${buildCycleLabel(currentMilestoneTurn, maxTurns)}.`;
+}
+
+function buildCritiqueStatusMessage(
+  mode: DebateMode,
+  currentTaskIndex: number,
+  currentMilestoneTurn: number,
+  maxTurns: number,
+  task: DebateTask,
+) {
+  if (getModeDefinition(mode).id === "writers_room") {
+    return `Editor is critiquing milestone ${currentTaskIndex + 1}: ${task.title}. ${buildCycleLabel(currentMilestoneTurn, maxTurns)}.`;
+  }
+
+  return `Participants are critiquing each other's milestone ${currentTaskIndex + 1} outputs. ${buildCycleLabel(currentMilestoneTurn, maxTurns)}.`;
+}
+
+function getParticipantConfig(config: RunConfig, role: ParticipantRole) {
+  return role === "participant_a" ? config.participantA : config.participantB;
+}
+
+function validateRefereeDecisionForMode(
+  mode: DebateMode,
+  decision: z.infer<typeof refereeDecisionSchema>,
+) {
+  if (decision.needsUserInput && !decision.questionBatch) {
+    throw new Error("The referee requested user input without returning a question batch.");
+  }
+
+  if (decision.needsUserInput && decision.converged) {
+    throw new Error("The referee cannot request user input and mark the milestone converged in the same decision.");
+  }
+
+  if (getModeDefinition(mode).id === "writers_room" && decision.preferredDraft === "participant_b") {
+    throw new Error("The editor cannot be preferred as the final draft author in writer's room mode.");
   }
 }
 
@@ -363,14 +906,13 @@ export class DebateCoordinator {
       {
         taskPlan: [],
         currentTaskIndex: 0,
+        currentMilestoneTurn: 0,
         answeredQuestionBatches: [],
+        carryForwardNotes: [],
         collectedSources: [],
-        latestA: null,
-        latestB: null,
-        latestCritiqueA: null,
-        latestCritiqueB: null,
+        latestDrafts: {},
+        latestCritiques: {},
         previousDecision: null,
-        refereeDecisions: [],
         startTurnIndex: 0,
       },
       { statusMessage: "Run started." },
@@ -384,7 +926,7 @@ export class DebateCoordinator {
       run: RunDetail;
     },
   ) {
-    if (!hasPlanningTurn(args.run.turns) || args.run.taskPlan.length === 0) {
+    if (!hasPlanningTurn(args.run.turns)) {
       throw new Error(
         "This failed run does not have a persisted milestone-planning step. Start a new run instead of retrying this legacy run.",
       );
@@ -412,53 +954,106 @@ export class DebateCoordinator {
       carryForwardDecision: boolean;
     },
   ): RunCheckpoint {
-    const participantTurns = [...run.turns]
-      .filter((turn) => turn.turnIndex >= run.currentTurn || options.carryForwardDecision)
+    const currentMilestoneStartTurn = Math.max(0, run.currentTurn - run.currentMilestoneTurn);
+    const relevantTurns = [...run.turns]
+      .filter((turn) => turn.turnIndex >= currentMilestoneStartTurn)
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-    const latestATurn = options.carryForwardDecision
-      ? participantTurns
-          .filter(
-            (turn) =>
-              turn.role === "participant_a" &&
-              (turn.phase === "proposal" || turn.phase === "revision"),
-          )
-          .at(-1)
+    const toolsByTurnId = buildTurnArtifactsByTurnId(run.toolInvocations);
+    const sourcesByTurnId = buildTurnArtifactsByTurnId(
+      run.sources.filter(
+        (source): source is SourceRecord & { turnId: string } => typeof source.turnId === "string",
+      ),
+    );
+    const latestDraftATurn = options.carryForwardDecision
+      ? latestTurnByPhases(relevantTurns, "participant_a", ["proposal", "revision"])
       : null;
-    const latestBTurn = options.carryForwardDecision
-      ? participantTurns
-          .filter(
-            (turn) =>
-              turn.role === "participant_b" &&
-              (turn.phase === "proposal" || turn.phase === "revision"),
-          )
-          .at(-1)
+    const latestDraftBTurn = options.carryForwardDecision
+      ? latestTurnByPhases(relevantTurns, "participant_b", ["proposal", "revision"])
       : null;
-    const latestACritique = options.carryForwardDecision
-      ? participantTurns
-          .filter((turn) => turn.role === "participant_a" && turn.phase === "critique")
-          .at(-1)
+    const latestCritiqueATurn = options.carryForwardDecision
+      ? latestTurnByPhases(relevantTurns, "participant_a", ["critique"])
       : null;
-    const latestBCritique = options.carryForwardDecision
-      ? participantTurns
-          .filter((turn) => turn.role === "participant_b" && turn.phase === "critique")
-          .at(-1)
+    const latestCritiqueBTurn = options.carryForwardDecision
+      ? latestTurnByPhases(relevantTurns, "participant_b", ["critique"])
       : null;
-    const previousDecision =
-      options.carryForwardDecision ? (run.refereeDecisions.at(-1) ?? null) : null;
+    const previousMilestoneDecision =
+      run.currentTaskIndex > 0
+        ? run.refereeDecisions.find(
+            (decision) => decision.turnIndex === currentMilestoneStartTurn - 1,
+          ) ?? null
+        : null;
 
     return {
       taskPlan: [...run.taskPlan],
       currentTaskIndex: run.currentTaskIndex,
+      currentMilestoneTurn: run.currentMilestoneTurn,
       answeredQuestionBatches: run.questionBatches.filter(
         (batch) => batch.status === "answered" || batch.status === "skipped",
       ),
+      carryForwardNotes: previousMilestoneDecision?.carryForwardNotes ?? [],
       collectedSources: [...run.sources],
-      latestA: latestATurn ? toParticipantTurnResult(latestATurn) : null,
-      latestB: latestBTurn ? toParticipantTurnResult(latestBTurn) : null,
-      latestCritiqueA: latestACritique ? toParticipantTurnResult(latestACritique) : null,
-      latestCritiqueB: latestBCritique ? toParticipantTurnResult(latestBCritique) : null,
-      previousDecision,
-      refereeDecisions: [...run.refereeDecisions],
+      latestDrafts: options.carryForwardDecision
+        ? {
+            participant_a: latestDraftATurn
+              ? {
+                  ...toParticipantTurnResult(latestDraftATurn),
+                  toolInvocations: toolsByTurnId.get(latestDraftATurn.id) ?? [],
+                  sources: sourcesByTurnId.get(latestDraftATurn.id) ?? [],
+                  evidencePacket: buildEvidencePacket({
+                    role: "participant_a",
+                    turn: latestDraftATurn,
+                    toolInvocations: toolsByTurnId.get(latestDraftATurn.id) ?? [],
+                    sources: sourcesByTurnId.get(latestDraftATurn.id) ?? [],
+                  }),
+                }
+              : undefined,
+            participant_b: latestDraftBTurn
+              ? {
+                  ...toParticipantTurnResult(latestDraftBTurn),
+                  toolInvocations: toolsByTurnId.get(latestDraftBTurn.id) ?? [],
+                  sources: sourcesByTurnId.get(latestDraftBTurn.id) ?? [],
+                  evidencePacket: buildEvidencePacket({
+                    role: "participant_b",
+                    turn: latestDraftBTurn,
+                    toolInvocations: toolsByTurnId.get(latestDraftBTurn.id) ?? [],
+                    sources: sourcesByTurnId.get(latestDraftBTurn.id) ?? [],
+                  }),
+                }
+              : undefined,
+          }
+        : {},
+      latestCritiques: options.carryForwardDecision
+        ? {
+            participant_a: latestCritiqueATurn
+              ? {
+                  ...toParticipantTurnResult(latestCritiqueATurn),
+                  toolInvocations: toolsByTurnId.get(latestCritiqueATurn.id) ?? [],
+                  sources: sourcesByTurnId.get(latestCritiqueATurn.id) ?? [],
+                  evidencePacket: buildEvidencePacket({
+                    role: "participant_a",
+                    turn: latestCritiqueATurn,
+                    toolInvocations: toolsByTurnId.get(latestCritiqueATurn.id) ?? [],
+                    sources: sourcesByTurnId.get(latestCritiqueATurn.id) ?? [],
+                  }),
+                }
+              : undefined,
+            participant_b: latestCritiqueBTurn
+              ? {
+                  ...toParticipantTurnResult(latestCritiqueBTurn),
+                  toolInvocations: toolsByTurnId.get(latestCritiqueBTurn.id) ?? [],
+                  sources: sourcesByTurnId.get(latestCritiqueBTurn.id) ?? [],
+                  evidencePacket: buildEvidencePacket({
+                    role: "participant_b",
+                    turn: latestCritiqueBTurn,
+                    toolInvocations: toolsByTurnId.get(latestCritiqueBTurn.id) ?? [],
+                    sources: sourcesByTurnId.get(latestCritiqueBTurn.id) ?? [],
+                  }),
+                }
+              : undefined,
+          }
+        : {},
+      previousDecision:
+        options.carryForwardDecision ? (run.refereeDecisions.at(-1) ?? null) : null,
       startTurnIndex: run.currentTurn,
     };
   }
@@ -472,40 +1067,20 @@ export class DebateCoordinator {
     },
   ) {
     const { runId, config, workspaceManifest, signal, waitForAnswers } = args;
-    const taskPlan =
-      checkpoint.taskPlan.length > 0
-        ? [...checkpoint.taskPlan]
-        : await this.createTaskPlan({
-            runId,
-            config,
-            signal,
-          });
-    assertMilestonePlan(taskPlan);
+    const debateMode = normalizeDebateMode(config.debateMode);
     let currentTaskIndex = checkpoint.currentTaskIndex;
-    let previousDecision: RefereeDecision | null = checkpoint.previousDecision;
+    let currentMilestoneTurn = checkpoint.currentMilestoneTurn;
     const answeredQuestionBatches = [...checkpoint.answeredQuestionBatches];
+    let carryForwardNotes = [...checkpoint.carryForwardNotes];
+    let taskPlan = [...checkpoint.taskPlan];
+    let previousDecision: RefereeDecision | null = checkpoint.previousDecision;
     const collectedSources = [...checkpoint.collectedSources];
-    const refereeDecisions = [...checkpoint.refereeDecisions];
-    let latestA: ParticipantTurnResult | null = checkpoint.latestA;
-    let latestB: ParticipantTurnResult | null = checkpoint.latestB;
-    let latestCritiqueA: ParticipantTurnResult | null = checkpoint.latestCritiqueA;
-    let latestCritiqueB: ParticipantTurnResult | null = checkpoint.latestCritiqueB;
-    const initialTurnIndex = options.finalizationOnly
-      ? latestA?.turn.turnIndex ?? checkpoint.startTurnIndex
-      : checkpoint.startTurnIndex;
-
-    if (checkpoint.taskPlan.length === 0) {
-      await saveTaskPlan(runId, taskPlan);
-      publish(runId, {
-        type: "status",
-        status: "running",
-        message: `Milestone plan created with ${taskPlan.length} step${taskPlan.length === 1 ? "" : "s"}.`,
-        at: isoNow(),
-      });
-    }
+    let latestDrafts: ParticipantResultMap = { ...checkpoint.latestDrafts };
+    let latestCritiques: ParticipantResultMap = { ...checkpoint.latestCritiques };
 
     await updateRunStatus(runId, "running", {
-      currentTurn: initialTurnIndex,
+      currentTurn: checkpoint.startTurnIndex,
+      currentMilestoneTurn,
       currentTaskIndex,
       activeQuestionBatchId: null,
     });
@@ -517,167 +1092,155 @@ export class DebateCoordinator {
     });
 
     try {
+      if (taskPlan.length === 0) {
+        taskPlan = await this.resolveTaskPlan({
+          runId,
+          config: {
+            ...config,
+            debateMode,
+          },
+          answeredQuestionBatches,
+          signal,
+          waitForAnswers,
+        });
+      }
+      assertMilestonePlan(taskPlan);
+
       if (options.finalizationOnly) {
         assertCompletedCycle({
+          debateMode,
           currentTaskIndex,
           finalDecision: previousDecision,
-          participantATurn: latestA?.turn ?? null,
-          participantBTurn: latestB?.turn ?? null,
-          participantACritique: latestCritiqueA?.turn ?? null,
-          participantBCritique: latestCritiqueB?.turn ?? null,
+          latestCritiques,
+          latestDrafts,
           taskPlan,
         });
 
         const stopReason = previousDecision?.converged ? "converged" : "max_turns";
-        const finalConsensus = await this.finalizeConsensus({
+        await this.completeRunFromCurrentCycle({
           runId,
-          participantATurn: latestA!.turn,
-          participantBTurn: latestB!.turn,
+          debateMode,
           finalDecision: previousDecision!,
+          latestDrafts,
           taskPlan,
           currentTaskIndex,
           sources: dedupeSources(collectedSources),
-        });
-
-        await saveFinalConsensus(runId, finalConsensus, stopReason);
-        publish(runId, {
-          type: "completed",
-          finalConsensus,
           stopReason,
-          at: isoNow(),
         });
         return;
       }
 
+      const totalCycleBudget = taskPlan.length * config.maxTurns;
+
       for (
         let turnIndex = checkpoint.startTurnIndex;
-        turnIndex < config.maxTurns;
+        turnIndex < totalCycleBudget;
         turnIndex += 1
       ) {
         assertNotAborted(signal);
         const currentTask = getCurrentTask(taskPlan, currentTaskIndex);
         if (!currentTask) {
-          throw new Error("The task plan has no current task.");
+          throw new Error("The task plan has no current milestone.");
         }
 
-        await updateRunStatus(runId, "running", {
+        await this.persistRunCursor({
+          runId,
           currentTurn: turnIndex,
+          currentMilestoneTurn,
           currentTaskIndex,
         });
         publish(runId, {
           type: "status",
           status: "running",
-          message: `Participants are drafting milestone ${currentTaskIndex + 1}: ${currentTask.title}.`,
+          message: buildDraftStatusMessage(
+            debateMode,
+            currentTaskIndex,
+            currentMilestoneTurn,
+            config.maxTurns,
+            currentTask,
+          ),
           at: isoNow(),
         });
 
-        const participantResultPromises: [
-          Promise<ParticipantTurnResult>,
-          Promise<ParticipantTurnResult>,
-        ] = [
-          this.executeParticipantTurn({
-            runId,
-            config,
-            role: "participant_a",
-            participant: config.participantA,
-            turnIndex,
-            workspaceManifest,
-            phase: previousDecision ? "revision" : "proposal",
-            taskPlan,
-            currentTaskIndex,
-            previousOwnTurn: latestA?.turn ?? null,
-            previousOpponentTurn: latestB?.turn ?? null,
-            previousOwnCritique: latestCritiqueA?.turn ?? null,
-            previousOpponentCritique: latestCritiqueB?.turn ?? null,
-            previousDecision,
-            answeredQuestionBatches,
-            signal,
-          }),
-          this.executeParticipantTurn({
-            runId,
-            config,
-            role: "participant_b",
-            participant: config.participantB,
-            turnIndex,
-            workspaceManifest,
-            phase: previousDecision ? "revision" : "proposal",
-            taskPlan,
-            currentTaskIndex,
-            previousOwnTurn: latestB?.turn ?? null,
-            previousOpponentTurn: latestA?.turn ?? null,
-            previousOwnCritique: latestCritiqueB?.turn ?? null,
-            previousOpponentCritique: latestCritiqueA?.turn ?? null,
-            previousDecision,
-            answeredQuestionBatches,
-            signal,
-          }),
-        ];
+        const draftResults = await this.executeParticipantPhaseSet({
+          runId,
+          config: {
+            ...config,
+            debateMode,
+          },
+          currentTaskIndex,
+          debateMode,
+          latestCritiques,
+          latestDrafts,
+          phase: previousDecision ? "revision" : "proposal",
+          roles: getModeDefinition(debateMode).draftRoles,
+          signal,
+          taskPlan,
+          turnIndex,
+          workspaceManifest,
+          answeredQuestionBatches,
+          parallel: getModeDefinition(debateMode).parallelDrafts,
+          currentMilestoneTurn,
+          maxMilestoneTurns: config.maxTurns,
+          carryForwardNotes,
+          previousDecision,
+        });
+        latestDrafts = {
+          ...latestDrafts,
+          ...draftResults,
+        };
+        for (const result of Object.values(draftResults)) {
+          if (result) {
+            collectedSources.push(...result.sources);
+          }
+        }
 
-        const participantResults = await Promise.all(participantResultPromises);
-
-        const [participantAResult, participantBResult]: [
-          ParticipantTurnResult,
-          ParticipantTurnResult,
-        ] = participantResults;
-
-        latestA = participantAResult;
-        latestB = participantBResult;
-        collectedSources.push(...participantAResult.sources, ...participantBResult.sources);
         publish(runId, {
           type: "status",
           status: "running",
-          message: `Participants are critiquing each other's milestone ${currentTaskIndex + 1} outputs.`,
+          message: buildCritiqueStatusMessage(
+            debateMode,
+            currentTaskIndex,
+            currentMilestoneTurn,
+            config.maxTurns,
+            currentTask,
+          ),
           at: isoNow(),
         });
 
-        const critiqueResultPromises: [
-          Promise<ParticipantTurnResult>,
-          Promise<ParticipantTurnResult>,
-        ] = [
-          this.executeParticipantTurn({
-            runId,
-            config,
-            role: "participant_a",
-            participant: config.participantA,
-            turnIndex,
-            workspaceManifest,
-            phase: "critique",
-            taskPlan,
-            currentTaskIndex,
-            previousOwnTurn: participantAResult.turn,
-            previousOpponentTurn: participantBResult.turn,
-            previousOwnCritique: null,
-            previousOpponentCritique: null,
-            previousDecision,
-            answeredQuestionBatches,
-            signal,
-          }),
-          this.executeParticipantTurn({
-            runId,
-            config,
-            role: "participant_b",
-            participant: config.participantB,
-            turnIndex,
-            workspaceManifest,
-            phase: "critique",
-            taskPlan,
-            currentTaskIndex,
-            previousOwnTurn: participantBResult.turn,
-            previousOpponentTurn: participantAResult.turn,
-            previousOwnCritique: null,
-            previousOpponentCritique: null,
-            previousDecision,
-            answeredQuestionBatches,
-            signal,
-          }),
-        ];
+        const critiqueResults = await this.executeParticipantPhaseSet({
+          runId,
+          config: {
+            ...config,
+            debateMode,
+          },
+          currentTaskIndex,
+          debateMode,
+          latestCritiques,
+          latestDrafts,
+          phase: "critique",
+          roles: getModeDefinition(debateMode).critiqueRoles,
+          signal,
+          taskPlan,
+          turnIndex,
+          workspaceManifest,
+          answeredQuestionBatches,
+          parallel: getModeDefinition(debateMode).parallelCritiques,
+          currentMilestoneTurn,
+          maxMilestoneTurns: config.maxTurns,
+          carryForwardNotes,
+          previousDecision,
+        });
+        latestCritiques = {
+          ...latestCritiques,
+          ...critiqueResults,
+        };
+        for (const result of Object.values(critiqueResults)) {
+          if (result) {
+            collectedSources.push(...result.sources);
+          }
+        }
 
-        const [participantACritique, participantBCritique] = await Promise.all(
-          critiqueResultPromises,
-        );
-        latestCritiqueA = participantACritique;
-        latestCritiqueB = participantBCritique;
-        collectedSources.push(...participantACritique.sources, ...participantBCritique.sources);
         publish(runId, {
           type: "status",
           status: "running",
@@ -687,37 +1250,37 @@ export class DebateCoordinator {
 
         const refereeResult = await this.executeRefereeTurn({
           runId,
-          config,
-          turnIndex,
-          taskPlan,
+          config: {
+            ...config,
+            debateMode,
+          },
           currentTaskIndex,
-          participantATurn: participantAResult.turn,
-          participantBTurn: participantBResult.turn,
-          participantACritique: participantACritique.turn,
-          participantBCritique: participantBCritique.turn,
+          debateMode,
+          latestCritiques,
+          latestDrafts,
           previousDecision,
+          currentMilestoneTurn,
+          maxMilestoneTurns: config.maxTurns,
+          carryForwardNotes,
           answeredQuestionBatches,
-          questionProposals: [
-            {
-              role: "participant_a",
-              proposals: [
-                ...participantAResult.questionProposals,
-                ...participantACritique.questionProposals,
-              ],
-            },
-            {
-              role: "participant_b",
-              proposals: [
-                ...participantBResult.questionProposals,
-                ...participantBCritique.questionProposals,
-              ],
-            },
-          ],
+          questionProposals: {
+            participant_a: [
+              ...(draftResults.participant_a?.questionProposals ?? []),
+              ...(critiqueResults.participant_a?.questionProposals ?? []),
+            ],
+            participant_b: [
+              ...(draftResults.participant_b?.questionProposals ?? []),
+              ...(critiqueResults.participant_b?.questionProposals ?? []),
+            ],
+          },
           signal,
+          taskPlan,
+          turnIndex,
         });
-
         previousDecision = refereeResult.decision;
-        refereeDecisions.push(refereeResult.decision);
+        const isFinalTask = currentTaskIndex >= taskPlan.length - 1;
+        const milestoneBudgetRemaining = currentMilestoneTurn < config.maxTurns - 1;
+        const nextTurnIndex = turnIndex + 1;
 
         if (refereeResult.decision.questionBatch) {
           await saveQuestionBatch(refereeResult.decision.questionBatch);
@@ -727,30 +1290,99 @@ export class DebateCoordinator {
             at: isoNow(),
           });
 
-          const answeredBatch = await waitForAnswers(
-            refereeResult.decision.questionBatch,
-            signal,
-          );
+          const answeredBatch = await waitForAnswers(refereeResult.decision.questionBatch, signal);
           answeredQuestionBatches.push(answeredBatch);
           publish(runId, {
             type: "question_batch_answered",
             batch: answeredBatch,
             at: isoNow(),
           });
+          publish(runId, {
+            type: "status",
+            status: "running",
+            message: milestoneBudgetRemaining
+              ? "Clarifications received. Re-running the current milestone with the new answers."
+              : isFinalTask
+                ? "Clarifications received after the final milestone hit its cycle cap. Finalizing from the latest completed cycle."
+                : "Clarifications received after this milestone hit its cycle cap. Advancing with carry-forward notes.",
+            at: isoNow(),
+          });
+          if (milestoneBudgetRemaining) {
+            currentMilestoneTurn += 1;
+            await this.persistRunCursor({
+              runId,
+              currentTurn: nextTurnIndex,
+              currentMilestoneTurn,
+              currentTaskIndex,
+            });
+            continue;
+          }
+
+          if (!isFinalTask) {
+            const completedTaskTitle = currentTask.title;
+            currentTaskIndex += 1;
+            currentMilestoneTurn = 0;
+            carryForwardNotes = refereeResult.decision.carryForwardNotes ?? [];
+            previousDecision = null;
+            latestDrafts = {};
+            latestCritiques = {};
+            await this.persistRunCursor({
+              runId,
+              currentTurn: nextTurnIndex,
+              currentMilestoneTurn,
+              currentTaskIndex,
+            });
+            const nextTask = getCurrentTask(taskPlan, currentTaskIndex);
+            publish(runId, {
+              type: "status",
+              status: "running",
+              message: nextTask
+                ? `Milestone "${completedTaskTitle}" reached its cycle cap after clarification. Advancing to ${nextTask.title}.`
+                : `Milestone "${completedTaskTitle}" reached its cycle cap after clarification. Advancing to the next step.`,
+              at: isoNow(),
+            });
+            continue;
+          }
+
+          assertCompletedCycle({
+            debateMode,
+            currentTaskIndex,
+            finalDecision: refereeResult.decision,
+            latestCritiques,
+            latestDrafts,
+            taskPlan,
+          });
+          await this.completeRunFromCurrentCycle({
+            runId,
+            debateMode,
+            finalDecision: refereeResult.decision,
+            latestDrafts,
+            taskPlan,
+            currentTaskIndex,
+            sources: dedupeSources(collectedSources),
+            stopReason: "max_turns",
+          });
+          return;
         }
 
-        const isFinalTask = currentTaskIndex >= taskPlan.length - 1;
         if (
           refereeResult.decision.converged &&
           isFinalTask &&
           decisionRequestsAnotherPass(refereeResult.decision) &&
-          turnIndex < config.maxTurns - 1
+          milestoneBudgetRemaining
         ) {
+          currentMilestoneTurn += 1;
+          await this.persistRunCursor({
+            runId,
+            currentTurn: nextTurnIndex,
+            currentMilestoneTurn,
+            currentTaskIndex,
+          });
           publish(runId, {
             type: "status",
             status: "running",
             message:
-              "Referee marked the final task converged but still asked for another pass. Continuing debate.",
+              "Referee marked the final milestone converged but still asked for another pass. Continuing debate.",
             at: isoNow(),
           });
           continue;
@@ -759,13 +1391,15 @@ export class DebateCoordinator {
         if (refereeResult.decision.converged && !isFinalTask) {
           const completedTaskTitle = currentTask.title;
           currentTaskIndex += 1;
+          currentMilestoneTurn = 0;
+          carryForwardNotes = refereeResult.decision.carryForwardNotes ?? [];
           previousDecision = null;
-          latestA = null;
-          latestB = null;
-          latestCritiqueA = null;
-          latestCritiqueB = null;
-          await updateRunStatus(runId, "running", {
-            currentTurn: turnIndex,
+          latestDrafts = {};
+          latestCritiques = {};
+          await this.persistRunCursor({
+            runId,
+            currentTurn: nextTurnIndex,
+            currentMilestoneTurn,
             currentTaskIndex,
           });
           const nextTask = getCurrentTask(taskPlan, currentTaskIndex);
@@ -782,61 +1416,106 @@ export class DebateCoordinator {
 
         if (refereeResult.decision.converged) {
           assertCompletedCycle({
+            debateMode,
             currentTaskIndex,
             finalDecision: refereeResult.decision,
-            participantATurn: participantAResult.turn,
-            participantBTurn: participantBResult.turn,
-            participantACritique: participantACritique.turn,
-            participantBCritique: participantBCritique.turn,
+            latestCritiques,
+            latestDrafts,
             taskPlan,
           });
-          const finalConsensus = await this.finalizeConsensus({
+          await this.completeRunFromCurrentCycle({
             runId,
-            participantATurn: participantAResult.turn,
-            participantBTurn: participantBResult.turn,
+            debateMode,
             finalDecision: refereeResult.decision,
+            latestDrafts,
             taskPlan,
             currentTaskIndex,
             sources: dedupeSources(collectedSources),
-          });
-
-          await saveFinalConsensus(runId, finalConsensus, "converged");
-          publish(runId, {
-            type: "completed",
-            finalConsensus,
             stopReason: "converged",
-            at: isoNow(),
           });
           return;
         }
+
+        if (!milestoneBudgetRemaining) {
+          if (!isFinalTask) {
+            const completedTaskTitle = currentTask.title;
+            currentTaskIndex += 1;
+            currentMilestoneTurn = 0;
+            carryForwardNotes = refereeResult.decision.carryForwardNotes ?? [];
+            previousDecision = null;
+            latestDrafts = {};
+            latestCritiques = {};
+            await this.persistRunCursor({
+              runId,
+              currentTurn: nextTurnIndex,
+              currentMilestoneTurn,
+              currentTaskIndex,
+            });
+            const nextTask = getCurrentTask(taskPlan, currentTaskIndex);
+            publish(runId, {
+              type: "status",
+              status: "running",
+              message: nextTask
+                ? `Milestone "${completedTaskTitle}" reached ${config.maxTurns} cycle${config.maxTurns === 1 ? "" : "s"}. Advancing to ${nextTask.title} with carry-forward notes.`
+                : `Milestone "${completedTaskTitle}" reached ${config.maxTurns} cycle${config.maxTurns === 1 ? "" : "s"}. Advancing to the next step.`,
+              at: isoNow(),
+            });
+            continue;
+          }
+
+          assertCompletedCycle({
+            debateMode,
+            currentTaskIndex,
+            finalDecision: refereeResult.decision,
+            latestCritiques,
+            latestDrafts,
+            taskPlan,
+          });
+          await this.completeRunFromCurrentCycle({
+            runId,
+            debateMode,
+            finalDecision: refereeResult.decision,
+            latestDrafts,
+            taskPlan,
+            currentTaskIndex,
+            sources: dedupeSources(collectedSources),
+            stopReason: "max_turns",
+          });
+          return;
+        }
+
+        currentMilestoneTurn += 1;
+        await this.persistRunCursor({
+          runId,
+          currentTurn: nextTurnIndex,
+          currentMilestoneTurn,
+          currentTaskIndex,
+        });
+        publish(runId, {
+          type: "status",
+          status: "running",
+          message: `Referee kept milestone ${currentTaskIndex + 1} open. Re-running ${buildCycleLabel(currentMilestoneTurn, config.maxTurns)} for ${currentTask.title}.`,
+          at: isoNow(),
+        });
       }
 
       assertCompletedCycle({
+        debateMode,
         currentTaskIndex,
         finalDecision: previousDecision,
-        participantATurn: latestA?.turn ?? null,
-        participantBTurn: latestB?.turn ?? null,
-        participantACritique: latestCritiqueA?.turn ?? null,
-        participantBCritique: latestCritiqueB?.turn ?? null,
+        latestCritiques,
+        latestDrafts,
         taskPlan,
       });
-
-      const finalConsensus = await this.finalizeConsensus({
+      await this.completeRunFromCurrentCycle({
         runId,
-        participantATurn: latestA!.turn,
-        participantBTurn: latestB!.turn,
+        debateMode,
         finalDecision: previousDecision!,
+        latestDrafts,
         taskPlan,
         currentTaskIndex,
         sources: dedupeSources(collectedSources),
-      });
-
-      await saveFinalConsensus(runId, finalConsensus, "max_turns");
-      publish(runId, {
-        type: "completed",
-        finalConsensus,
         stopReason: "max_turns",
-        at: isoNow(),
       });
     } catch (error) {
       if (signal.aborted) {
@@ -867,22 +1546,209 @@ export class DebateCoordinator {
     }
   }
 
-  private async createTaskPlan(args: {
+  private async resolveTaskPlan(args: {
     runId: string;
     config: RunConfig;
+    answeredQuestionBatches: UserQuestionBatch[];
+    signal: AbortSignal;
+    waitForAnswers: ExecuteRunArgs["waitForAnswers"];
+  }) {
+    while (true) {
+      const planningResult = await this.executePlanningTurn(args);
+      if (planningResult.taskPlan) {
+        await saveTaskPlan(args.runId, planningResult.taskPlan);
+        publish(args.runId, {
+          type: "status",
+          status: "running",
+          message: `Milestone plan created with ${planningResult.taskPlan.length} step${planningResult.taskPlan.length === 1 ? "" : "s"}.`,
+          at: isoNow(),
+        });
+        return planningResult.taskPlan;
+      }
+
+      if (!planningResult.questionBatch) {
+        throw new Error("The planning pass did not return milestones or a clarification batch.");
+      }
+
+      await saveQuestionBatch(planningResult.questionBatch);
+      publish(args.runId, {
+        type: "question_batch",
+        batch: planningResult.questionBatch,
+        at: isoNow(),
+      });
+      const answeredBatch = await args.waitForAnswers(planningResult.questionBatch, args.signal);
+      args.answeredQuestionBatches.push(answeredBatch);
+      publish(args.runId, {
+        type: "question_batch_answered",
+        batch: answeredBatch,
+        at: isoNow(),
+      });
+      publish(args.runId, {
+        type: "status",
+        status: "running",
+        message: "Referee is replanning the milestone list with the new clarifications.",
+        at: isoNow(),
+      });
+    }
+  }
+
+  private async executeChatCompletionWithRetry(args: {
+    buildRequest: (context: { attempt: number; maxAttempts: number }) => Omit<
+      Parameters<ProviderAdapter["createChatStream"]>[0],
+      "signal"
+    >;
+    label: string;
+    modelId: string;
+    phase: TurnPhase;
+    role: ActorRole;
+    runId: string;
+    signal: AbortSignal;
+    turnIndex: number;
+  }) {
+    return executeChatWithRetry({
+      label: args.label,
+      signal: args.signal,
+      onAttemptRetry: ({ attempt, lastError, maxAttempts, retryDelayMs }) => {
+        publishTurnRetrying({
+          attempt,
+          lastError,
+          maxAttempts,
+          modelId: args.modelId,
+          phase: args.phase,
+          retryDelayMs,
+          role: args.role,
+          runId: args.runId,
+          turnIndex: args.turnIndex,
+        });
+        publish(args.runId, {
+          type: "status",
+          status: "running",
+          message: buildRetryStatusMessage({
+            attempt,
+            label: args.label,
+            lastError,
+            maxAttempts,
+            retryDelayMs,
+          }),
+          at: isoNow(),
+        });
+      },
+      onAttemptStart: ({ attempt, maxAttempts }) => {
+        publishTurnStarted({
+          attempt,
+          maxAttempts,
+          modelId: args.modelId,
+          phase: args.phase,
+          role: args.role,
+          runId: args.runId,
+          turnIndex: args.turnIndex,
+        });
+      },
+      execute: ({ attempt, maxAttempts }) =>
+        this.adapter.createChatStream({
+          ...args.buildRequest({ attempt, maxAttempts }),
+          signal: args.signal,
+        }),
+    });
+  }
+
+  private async executeStructuredChatCompletionWithRetry<T>(args: {
+    buildRequest: (context: {
+      attempt: number;
+      maxAttempts: number;
+      repairState: null | { invalidOutput: string; validationError: string };
+    }) => Omit<Parameters<ProviderAdapter["createChatStream"]>[0], "signal">;
+    label: string;
+    modelId: string;
+    phase: TurnPhase;
+    responseSchema: z.ZodSchema<T>;
+    role: ActorRole;
+    runId: string;
+    signal: AbortSignal;
+    turnIndex: number;
+  }) {
+    let repairState: null | { invalidOutput: string; validationError: string } = null;
+
+    return executeChatWithRetry({
+      label: args.label,
+      signal: args.signal,
+      onAttemptRetry: ({ attempt, lastError, maxAttempts, retryDelayMs }) => {
+        publishTurnRetrying({
+          attempt,
+          lastError,
+          maxAttempts,
+          modelId: args.modelId,
+          phase: args.phase,
+          retryDelayMs,
+          role: args.role,
+          runId: args.runId,
+          turnIndex: args.turnIndex,
+        });
+        publish(args.runId, {
+          type: "status",
+          status: "running",
+          message: buildRetryStatusMessage({
+            attempt,
+            label: args.label,
+            lastError,
+            maxAttempts,
+            retryDelayMs,
+          }),
+          at: isoNow(),
+        });
+      },
+      onAttemptStart: ({ attempt, maxAttempts }) => {
+        publishTurnStarted({
+          attempt,
+          maxAttempts,
+          modelId: args.modelId,
+          phase: args.phase,
+          role: args.role,
+          runId: args.runId,
+          turnIndex: args.turnIndex,
+        });
+      },
+      execute: async ({ attempt, maxAttempts }) => {
+        const response = await this.adapter.createChatStream({
+          ...args.buildRequest({
+            attempt,
+            maxAttempts,
+            repairState,
+          }),
+          signal: args.signal,
+        });
+
+        try {
+          return {
+            parsed: parseJsonFromModel(response.content, args.responseSchema),
+            response,
+          };
+        } catch (error) {
+          if (!repairState) {
+            repairState = {
+              invalidOutput: response.content,
+              validationError: formatStructuredOutputError(error),
+            };
+            throw new RetryableStructuredOutputError(
+              `${args.label} returned invalid structured output. ${repairState.validationError}`,
+            );
+          }
+
+          throw error;
+        }
+      },
+    });
+  }
+
+  private async executePlanningTurn(args: {
+    runId: string;
+    config: RunConfig;
+    answeredQuestionBatches: UserQuestionBatch[];
     signal: AbortSignal;
   }) {
     assertNotAborted(args.signal);
     const start = Date.now();
     const turnIndex = -1;
-    publish(args.runId, {
-      type: "turn_started",
-      role: "referee",
-      phase: "planning",
-      turnIndex,
-      modelId: args.config.referee.modelId,
-      at: isoNow(),
-    });
     publish(args.runId, {
       type: "status",
       status: "running",
@@ -890,36 +1756,67 @@ export class DebateCoordinator {
       at: isoNow(),
     });
 
-    const response = await this.adapter.createChatStream({
-      modelId: args.config.referee.modelId,
-      responseFormat: "json_object",
-      temperature: 0.1,
-      signal: args.signal,
-      onTextDelta: ({ delta, content }) => {
-        publishTurnDelta({
-          runId: args.runId,
-          role: "referee",
-          phase: "planning",
-          turnIndex,
-          modelId: args.config.referee.modelId,
-          delta,
-          content,
-        });
+    const baseMessages: ProviderMessage[] = [
+      {
+        role: "system",
+        content: buildTaskPlanSystemPrompt(normalizeDebateMode(args.config.debateMode)),
       },
-      messages: [
-        {
-          role: "system",
-          content: buildTaskPlanSystemPrompt(),
+      {
+        role: "user",
+        content: buildTaskPlanUserPrompt({
+          debateMode: normalizeDebateMode(args.config.debateMode),
+          taskPrompt: args.config.taskPrompt,
+          answeredQuestionBatches: args.answeredQuestionBatches,
+        }),
+      },
+    ];
+
+    const { parsed, response } = await this.executeStructuredChatCompletionWithRetry({
+      label: "Referee planning",
+      modelId: args.config.referee.modelId,
+      phase: "planning",
+      responseSchema: planningResponseSchema,
+      role: "referee",
+      runId: args.runId,
+      signal: args.signal,
+      turnIndex,
+      buildRequest: ({ attempt, maxAttempts, repairState }) => ({
+        modelId: args.config.referee.modelId,
+        responseFormat: "json_object",
+        temperature: 0.1,
+        onTextDelta: ({ delta, content }) => {
+          publishTurnDelta({
+            attempt,
+            runId: args.runId,
+            maxAttempts,
+            role: "referee",
+            phase: "planning",
+            turnIndex,
+            modelId: args.config.referee.modelId,
+            delta,
+            content,
+          });
         },
-        {
-          role: "user",
-          content: buildTaskPlanUserPrompt(args.config.taskPrompt),
-        },
-      ],
+        messages: repairState
+          ? buildStructuredRepairMessages({
+              invalidOutput: repairState.invalidOutput,
+              messages: baseMessages,
+              validationError: repairState.validationError,
+            })
+          : baseMessages,
+      }),
     });
 
-    const parsed = parseJsonFromModel(response.content, taskPlanSchema);
-    const taskPlan = toTaskPlan(parsed.tasks);
+    const questionBatch =
+      parsed.outcome === "question_batch"
+        ? createQuestionBatch(args.runId, parsed.questionBatch)
+        : null;
+    const taskPlan = parsed.outcome === "tasks" ? toTaskPlan(parsed.tasks) : null;
+
+    if (!questionBatch && (!taskPlan || taskPlan.length === 0)) {
+      throw new Error("Milestone planning must produce a non-empty task list or a clarification batch.");
+    }
+
     const planningTurn: TurnRecord = {
       id: crypto.randomUUID(),
       runId: args.runId,
@@ -928,7 +1825,10 @@ export class DebateCoordinator {
       phase: "planning",
       modelId: args.config.referee.modelId,
       content: JSON.stringify(parsed, null, 2),
-      summary: `Generated ${taskPlan.length} task${taskPlan.length === 1 ? "" : "s"}.`,
+      summary:
+        parsed.outcome === "tasks"
+          ? `Generated ${taskPlan!.length} task${taskPlan!.length === 1 ? "" : "s"}.`
+          : parsed.summary,
       latencyMs: Date.now() - start,
       tokenUsage: response.usage ?? null,
       createdAt: isoNow(),
@@ -941,35 +1841,35 @@ export class DebateCoordinator {
       at: isoNow(),
     });
 
-    return taskPlan;
+    return {
+      questionBatch,
+      taskPlan,
+    };
   }
 
   private async finalizeConsensus(args: {
     runId: string;
-    participantATurn: TurnRecord;
-    participantBTurn: TurnRecord;
+    debateMode: DebateMode;
     finalDecision: RefereeDecision;
+    latestDrafts: ParticipantResultMap;
     taskPlan: DebateTask[];
     currentTaskIndex: number;
     sources: SourceRecord[];
   }): Promise<FinalConsensus> {
-    const preferredTurn = pickPreferredTurn({
-      participantATurn: args.participantATurn,
-      participantBTurn: args.participantBTurn,
-      preferredDraft: args.finalDecision.preferredDraft,
+    assertFinalMilestoneForFinalization(args.taskPlan, args.currentTaskIndex);
+
+    const { selectedTurn, usedTieFallback } = selectFinalTurn({
+      debateMode: args.debateMode,
+      finalDecision: args.finalDecision,
+      latestDrafts: args.latestDrafts,
     });
-    const usedTieFallback = !preferredTurn;
-    const selectedTurn = preferredTurn ?? args.participantATurn;
-    if (selectedTurn.role === "referee") {
-      throw new Error("Final selection cannot be authored by the referee.");
-    }
 
     const finalConsensus: FinalConsensus = {
       solution: selectedTurn.content.trim(),
       rationale: buildSelectionRationale({
         finalDecision: args.finalDecision,
-        taskPlan: args.taskPlan.slice(0, args.currentTaskIndex + 1),
         selectedTurn,
+        taskPlan: args.taskPlan.slice(0, args.currentTaskIndex + 1),
         usedTieFallback,
       }),
       sources: args.sources,
@@ -990,8 +1890,118 @@ export class DebateCoordinator {
     };
 
     await recordTurn(finalTurn);
-
     return finalConsensus;
+  }
+
+  private async completeRunFromCurrentCycle(args: {
+    runId: string;
+    debateMode: DebateMode;
+    finalDecision: RefereeDecision;
+    latestDrafts: ParticipantResultMap;
+    taskPlan: DebateTask[];
+    currentTaskIndex: number;
+    sources: SourceRecord[];
+    stopReason: "converged" | "max_turns";
+  }) {
+    const finalConsensus = await this.finalizeConsensus({
+      runId: args.runId,
+      debateMode: args.debateMode,
+      finalDecision: args.finalDecision,
+      latestDrafts: args.latestDrafts,
+      taskPlan: args.taskPlan,
+      currentTaskIndex: args.currentTaskIndex,
+      sources: args.sources,
+    });
+
+    await saveFinalConsensus(args.runId, finalConsensus, args.stopReason);
+    publish(args.runId, {
+      type: "completed",
+      finalConsensus,
+      stopReason: args.stopReason,
+      at: isoNow(),
+    });
+  }
+
+  private async persistRunCursor(args: {
+    runId: string;
+    currentTurn: number;
+    currentMilestoneTurn: number;
+    currentTaskIndex: number;
+  }) {
+    await updateRunStatus(args.runId, "running", {
+      currentTurn: args.currentTurn,
+      currentMilestoneTurn: args.currentMilestoneTurn,
+      currentTaskIndex: args.currentTaskIndex,
+    });
+  }
+
+  private async executeParticipantPhaseSet(args: {
+    runId: string;
+    config: RunConfig;
+    currentTaskIndex: number;
+    currentMilestoneTurn: number;
+    maxMilestoneTurns: number;
+    carryForwardNotes: string[];
+    debateMode: DebateMode;
+    latestCritiques: ParticipantResultMap;
+    latestDrafts: ParticipantResultMap;
+    phase: "proposal" | "revision" | "critique";
+    parallel: boolean;
+    previousDecision: RefereeDecision | null;
+    roles: ParticipantRole[];
+    signal: AbortSignal;
+    taskPlan: DebateTask[];
+    turnIndex: number;
+    workspaceManifest?: WorkspaceManifest | null;
+    answeredQuestionBatches: UserQuestionBatch[];
+  }) {
+    const executeForRole = async (role: ParticipantRole) =>
+      this.executeParticipantTurn({
+        runId: args.runId,
+        config: args.config,
+        role,
+        participant: getParticipantConfig(args.config, role),
+        turnIndex: args.turnIndex,
+        workspaceManifest: args.workspaceManifest,
+        phase: args.phase,
+        taskPlan: args.taskPlan,
+        currentTaskIndex: args.currentTaskIndex,
+        currentMilestoneTurn: args.currentMilestoneTurn,
+        maxMilestoneTurns: args.maxMilestoneTurns,
+        previousOwnTurn: args.latestDrafts[role]?.turn ?? null,
+        previousOpponentTurn:
+          args.latestDrafts[getOtherParticipantRole(role)]?.turn ?? null,
+        previousOwnCritique: args.latestCritiques[role]?.turn ?? null,
+        previousOpponentCritique:
+          args.latestCritiques[getOtherParticipantRole(role)]?.turn ?? null,
+        previousDecision: args.previousDecision,
+        carryForwardNotes: args.carryForwardNotes,
+        sharedEvidence:
+          args.phase === "critique"
+            ? args.latestDrafts[getOtherParticipantRole(role)]?.evidencePacket ?? null
+            : args.latestCritiques[getOtherParticipantRole(role)]?.evidencePacket ??
+              args.latestDrafts[getOtherParticipantRole(role)]?.evidencePacket ??
+              null,
+        answeredQuestionBatches: args.answeredQuestionBatches,
+        signal: args.signal,
+      });
+
+    const results: ParticipantResultMap = {};
+    if (args.parallel) {
+      const entries = await Promise.all(
+        args.roles.map(async (role) => [role, await executeForRole(role)] as const),
+      );
+      for (const [role, result] of entries) {
+        results[role] = result;
+      }
+      return results;
+    }
+
+    for (const role of args.roles) {
+      results[role] = await executeForRole(role);
+    }
+
+    return results;
   }
 
   private async executeParticipantTurn(args: {
@@ -1004,60 +2014,84 @@ export class DebateCoordinator {
     phase: "proposal" | "revision" | "critique";
     taskPlan: DebateTask[];
     currentTaskIndex: number;
+    currentMilestoneTurn: number;
+    maxMilestoneTurns: number;
     previousOwnTurn?: TurnRecord | null;
     previousOpponentTurn?: TurnRecord | null;
     previousOwnCritique?: TurnRecord | null;
     previousOpponentCritique?: TurnRecord | null;
     previousDecision?: RefereeDecision | null;
+    carryForwardNotes: string[];
+    sharedEvidence?: EvidencePacket | null;
     answeredQuestionBatches: UserQuestionBatch[];
     signal: AbortSignal;
   }): Promise<ParticipantTurnResult> {
+    const mode = getModeDefinition(args.config.debateMode);
     const start = Date.now();
     const turnId = crypto.randomUUID();
 
-    if (
-      args.phase === "critique" &&
-      (!args.previousOwnTurn || !args.previousOpponentTurn)
-    ) {
-      throw new Error(`${args.role} cannot enter critique phase without both participant outputs.`);
+    if (args.phase === "critique" && !mode.critiqueRoles.includes(args.role)) {
+      throw new Error(
+        `${getDebateRoleLabel(mode.id, args.role)} cannot enter critique phase in ${mode.id}.`,
+      );
     }
 
-    publish(args.runId, {
-      type: "turn_started",
-      role: args.role,
-      phase: args.phase,
-      turnIndex: args.turnIndex,
-      modelId: args.participant.modelId,
-      at: isoNow(),
-    });
+    if (args.phase !== "critique" && !mode.draftRoles.includes(args.role)) {
+      throw new Error(
+        `${getDebateRoleLabel(mode.id, args.role)} cannot enter draft phase in ${mode.id}.`,
+      );
+    }
+
+    if (args.phase === "critique" && !args.previousOpponentTurn) {
+      throw new Error(`${args.role} cannot enter critique phase without an authored output to review.`);
+    }
+
+    if (
+      args.phase === "critique" &&
+      mode.draftRoles.includes(args.role) &&
+      !args.previousOwnTurn
+    ) {
+      throw new Error(`${args.role} cannot critique without its own authored output in the current mode.`);
+    }
 
     const messages: ProviderMessage[] = [
       {
         role: "system",
-        content: buildParticipantSystemPrompt(
-          args.role,
-          args.participant.persona,
-          args.workspaceManifest,
-        ),
+        content: buildParticipantSystemPrompt({
+          debateMode: mode.id,
+          role: args.role,
+          persona: args.participant.persona,
+          manifest: args.workspaceManifest,
+        }),
       },
       {
         role: "user",
         content:
           args.phase === "critique"
             ? buildParticipantCritiqueUserPrompt({
+                debateMode: mode.id,
+                role: args.role,
                 taskPrompt: args.config.taskPrompt,
                 taskPlan: args.taskPlan,
                 currentTaskIndex: args.currentTaskIndex,
+                currentMilestoneTurn: args.currentMilestoneTurn,
+                maxMilestoneTurns: args.maxMilestoneTurns,
                 turnIndex: args.turnIndex,
-                ownTurn: args.previousOwnTurn!,
+                ownTurn: args.previousOwnTurn,
                 opponentTurn: args.previousOpponentTurn!,
                 previousDecision: args.previousDecision,
+                carryForwardNotes: args.carryForwardNotes,
+                sharedEvidence: args.sharedEvidence,
                 answeredQuestionBatches: args.answeredQuestionBatches,
               })
             : buildParticipantUserPrompt({
+                debateMode: mode.id,
+                role: args.role,
                 taskPrompt: args.config.taskPrompt,
                 taskPlan: args.taskPlan,
                 currentTaskIndex: args.currentTaskIndex,
+                currentMilestoneTurn: args.currentMilestoneTurn,
+                maxMilestoneTurns: args.maxMilestoneTurns,
                 turnIndex: args.turnIndex,
                 phase: args.phase,
                 previousOwnTurn: args.previousOwnTurn,
@@ -1065,6 +2099,8 @@ export class DebateCoordinator {
                 previousOwnCritique: args.previousOwnCritique,
                 previousOpponentCritique: args.previousOpponentCritique,
                 previousDecision: args.previousDecision,
+                carryForwardNotes: args.carryForwardNotes,
+                sharedEvidence: args.sharedEvidence,
                 answeredQuestionBatches: args.answeredQuestionBatches,
               }),
       },
@@ -1075,25 +2111,35 @@ export class DebateCoordinator {
     const questionProposals: UserQuestionProposal[] = [];
     let latestUsage: TurnRecord["tokenUsage"] = null;
 
-    for (let loopCount = 0; loopCount < 6; loopCount += 1) {
+    for (let loopCount = 0; loopCount < PARTICIPANT_MAX_TOOL_EXCHANGES; loopCount += 1) {
       assertNotAborted(args.signal);
-      const response = await this.adapter.createChatStream({
+      const response = await this.executeChatCompletionWithRetry({
+        label: `${getDebateRoleLabel(mode.id, args.role)} ${formatPhaseName(args.phase)}`,
         modelId: args.participant.modelId,
-        messages,
-        tools: participantToolDefinitions,
-        temperature: 0.3,
+        phase: args.phase,
+        role: args.role,
+        runId: args.runId,
         signal: args.signal,
-        onTextDelta: ({ delta, content }) => {
-          publishTurnDelta({
-            runId: args.runId,
-            role: args.role,
-            phase: args.phase,
-            turnIndex: args.turnIndex,
-            modelId: args.participant.modelId,
-            delta,
-            content,
-          });
-        },
+        turnIndex: args.turnIndex,
+        buildRequest: ({ attempt, maxAttempts }) => ({
+          modelId: args.participant.modelId,
+          messages,
+          tools: participantToolDefinitions,
+          temperature: 0.3,
+          onTextDelta: ({ delta, content }) => {
+            publishTurnDelta({
+              attempt,
+              runId: args.runId,
+              maxAttempts,
+              role: args.role,
+              phase: args.phase,
+              turnIndex: args.turnIndex,
+              modelId: args.participant.modelId,
+              delta,
+              content,
+            });
+          },
+        }),
       });
 
       latestUsage = response.usage ?? null;
@@ -1122,6 +2168,12 @@ export class DebateCoordinator {
           createdAt: isoNow(),
         };
         await recordTurn(turn);
+        const evidencePacket = buildEvidencePacket({
+          role: args.role,
+          turn,
+          toolInvocations,
+          sources: collectedSources,
+        });
         publish(args.runId, {
           type: "turn_completed",
           turn,
@@ -1129,6 +2181,7 @@ export class DebateCoordinator {
         });
 
         return {
+          evidencePacket,
           turn,
           toolInvocations,
           sources: collectedSources,
@@ -1149,6 +2202,7 @@ export class DebateCoordinator {
           role: args.role,
           modelId: args.participant.modelId,
           searchBackend: args.config.searchBackend,
+          signal: args.signal,
           workspaceManifest: args.workspaceManifest,
         });
 
@@ -1179,89 +2233,135 @@ export class DebateCoordinator {
       }
     }
 
-    throw new Error(`${args.role} exceeded the maximum tool iteration count.`);
+    throw new Error(
+      `${args.role} exceeded the maximum tool exchange count (${PARTICIPANT_MAX_TOOL_EXCHANGES}).`,
+    );
   }
 
   private async executeRefereeTurn(args: {
     runId: string;
     config: RunConfig;
-    turnIndex: number;
-    taskPlan: DebateTask[];
     currentTaskIndex: number;
-    participantATurn: TurnRecord;
-    participantBTurn: TurnRecord;
-    participantACritique?: TurnRecord | null;
-    participantBCritique?: TurnRecord | null;
+    currentMilestoneTurn: number;
+    maxMilestoneTurns: number;
+    carryForwardNotes: string[];
+    debateMode: DebateMode;
+    latestCritiques: ParticipantResultMap;
+    latestDrafts: ParticipantResultMap;
     previousDecision?: RefereeDecision | null;
     answeredQuestionBatches: UserQuestionBatch[];
-    questionProposals: Array<{
-      role: ParticipantRole;
-      proposals: UserQuestionProposal[];
-    }>;
+    questionProposals: Record<ParticipantRole, UserQuestionProposal[]>;
     signal: AbortSignal;
+    taskPlan: DebateTask[];
+    turnIndex: number;
   }) {
     assertNotAborted(args.signal);
-    if (!args.participantACritique || !args.participantBCritique) {
-      throw new Error("The referee cannot evaluate a milestone before both critiques are complete.");
-    }
-    if (
-      args.participantATurn.turnIndex !== args.turnIndex ||
-      args.participantBTurn.turnIndex !== args.turnIndex ||
-      args.participantACritique.turnIndex !== args.turnIndex ||
-      args.participantBCritique.turnIndex !== args.turnIndex
-    ) {
-      throw new Error("The referee can only evaluate a completed cycle for the current milestone.");
-    }
-    publish(args.runId, {
-      type: "turn_started",
-      role: "referee",
-      phase: "referee",
-      turnIndex: args.turnIndex,
-      modelId: args.config.referee.modelId,
-      at: isoNow(),
-    });
+    const mode = getModeDefinition(args.debateMode);
 
-    const response = await this.adapter.createChatStream({
-      modelId: args.config.referee.modelId,
-      responseFormat: "json_object",
-      temperature: 0.2,
-      signal: args.signal,
-      onTextDelta: ({ delta, content }) => {
-        publishTurnDelta({
-          runId: args.runId,
-          role: "referee",
-          phase: "referee",
-          turnIndex: args.turnIndex,
-          modelId: args.config.referee.modelId,
-          delta,
-          content,
-        });
+    for (const role of mode.draftRoles) {
+      const turn = args.latestDrafts[role]?.turn ?? null;
+      if (!turn) {
+        throw new Error("The referee cannot evaluate a milestone before the mode's draft steps are complete.");
+      }
+      if (turn.turnIndex !== args.turnIndex) {
+        throw new Error("The referee can only evaluate a completed cycle for the current milestone.");
+      }
+    }
+
+    for (const role of mode.critiqueRoles) {
+      const turn = args.latestCritiques[role]?.turn ?? null;
+      if (!turn) {
+        throw new Error("The referee cannot evaluate a milestone before the mode's critique steps are complete.");
+      }
+      if (turn.turnIndex !== args.turnIndex) {
+        throw new Error("The referee can only evaluate a completed cycle for the current milestone.");
+      }
+    }
+
+    const start = Date.now();
+    const baseMessages: ProviderMessage[] = [
+      {
+        role: "system",
+        content: buildRefereeSystemPrompt({
+          debateMode: mode.id,
+          persona: args.config.referee.persona,
+        }),
       },
-      messages: [
-        {
-          role: "system",
-          content: buildRefereeSystemPrompt(args.config.referee.persona),
-        },
-        {
-          role: "user",
-          content: buildRefereeUserPrompt({
-            taskPrompt: args.config.taskPrompt,
-            taskPlan: args.taskPlan,
-            currentTaskIndex: args.currentTaskIndex,
-            turnIndex: args.turnIndex,
-            participantATurn: args.participantATurn,
-            participantBTurn: args.participantBTurn,
-            participantACritique: args.participantACritique,
-            participantBCritique: args.participantBCritique,
-            previousDecision: args.previousDecision,
-            answeredQuestionBatches: args.answeredQuestionBatches,
-            questionProposals: args.questionProposals,
-          }),
-        },
-      ],
-    });
+      {
+        role: "user",
+        content: buildRefereeUserPrompt({
+          debateMode: mode.id,
+          taskPrompt: args.config.taskPrompt,
+          taskPlan: args.taskPlan,
+          currentTaskIndex: args.currentTaskIndex,
+          currentMilestoneTurn: args.currentMilestoneTurn,
+          maxMilestoneTurns: args.maxMilestoneTurns,
+          turnIndex: args.turnIndex,
+          participantATurn: args.latestDrafts.participant_a?.turn ?? null,
+          participantBTurn: args.latestDrafts.participant_b?.turn ?? null,
+          participantACritique: args.latestCritiques.participant_a?.turn ?? null,
+          participantBCritique: args.latestCritiques.participant_b?.turn ?? null,
+          previousDecision: args.previousDecision,
+          carryForwardNotes: args.carryForwardNotes,
+          evidencePackets: dedupeEvidencePackets([
+            args.latestDrafts.participant_a?.evidencePacket ?? null,
+            args.latestDrafts.participant_b?.evidencePacket ?? null,
+            args.latestCritiques.participant_a?.evidencePacket ?? null,
+            args.latestCritiques.participant_b?.evidencePacket ?? null,
+          ]),
+          answeredQuestionBatches: args.answeredQuestionBatches,
+          questionProposals: [
+            {
+              role: "participant_a",
+              proposals: args.questionProposals.participant_a,
+            },
+            {
+              role: "participant_b",
+              proposals: args.questionProposals.participant_b,
+            },
+          ],
+        }),
+      },
+    ];
 
-    const parsedDecision = parseJsonFromModel(response.content, refereeDecisionSchema);
+    const { parsed: parsedDecision, response } =
+      await this.executeStructuredChatCompletionWithRetry({
+        label: "Referee evaluation",
+        modelId: args.config.referee.modelId,
+        phase: "referee",
+        responseSchema: refereeDecisionSchema,
+        role: "referee",
+        runId: args.runId,
+        signal: args.signal,
+        turnIndex: args.turnIndex,
+        buildRequest: ({ attempt, maxAttempts, repairState }) => ({
+          modelId: args.config.referee.modelId,
+          responseFormat: "json_object",
+          temperature: 0.2,
+          onTextDelta: ({ delta, content }) => {
+            publishTurnDelta({
+              attempt,
+              runId: args.runId,
+              maxAttempts,
+              role: "referee",
+              phase: "referee",
+              turnIndex: args.turnIndex,
+              modelId: args.config.referee.modelId,
+              delta,
+              content,
+            });
+          },
+          messages: repairState
+            ? buildStructuredRepairMessages({
+                invalidOutput: repairState.invalidOutput,
+                messages: baseMessages,
+                validationError: repairState.validationError,
+              })
+            : baseMessages,
+        }),
+      });
+    validateRefereeDecisionForMode(mode.id, parsedDecision);
+
     const questionBatch =
       parsedDecision.needsUserInput && parsedDecision.questionBatch
         ? createQuestionBatch(args.runId, parsedDecision.questionBatch)
@@ -1277,6 +2377,9 @@ export class DebateCoordinator {
       preferredDraft: parsedDecision.preferredDraft,
       requiredNextFocus: parsedDecision.requiredNextFocus,
       remainingDisagreements: parsedDecision.remainingDisagreements,
+      blockingIssues: parsedDecision.blockingIssues ?? [],
+      carryForwardNotes: parsedDecision.carryForwardNotes ?? [],
+      diminishingReturns: parsedDecision.diminishingReturns ?? [],
       needsUserInput: parsedDecision.needsUserInput && !!questionBatch,
       questionBatch,
       createdAt: isoNow(),
@@ -1291,7 +2394,7 @@ export class DebateCoordinator {
       modelId: args.config.referee.modelId,
       content: JSON.stringify(parsedDecision, null, 2),
       summary: parsedDecision.summary,
-      latencyMs: null,
+      latencyMs: Date.now() - start,
       tokenUsage: response.usage ?? null,
       createdAt: isoNow(),
     };
@@ -1309,7 +2412,6 @@ export class DebateCoordinator {
       at: isoNow(),
     });
 
-    return { turn, decision };
+    return { decision, turn };
   }
-
 }

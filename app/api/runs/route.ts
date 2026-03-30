@@ -1,18 +1,24 @@
 import { NextResponse } from "next/server";
 
+import { normalizeDebateMode } from "@/lib/debate-mode";
 import { createRun, hasActiveRun, listRunSummaries } from "@/lib/data/run-store";
 import { getServerEnv } from "@/lib/env";
 import { validateRunConfig } from "@/lib/services/models";
 import { runsManager } from "@/lib/services/runs-manager";
 import { validateWorkspacePath } from "@/lib/services/workspace-tools";
 import type { RunConfig } from "@/lib/types";
-import { normalizeParticipantConfig, runConfigSchema } from "@/lib/validation";
+import {
+  type RunConfigInput,
+  normalizeParticipantConfig,
+  runConfigSchema,
+} from "@/lib/validation";
 
 export const runtime = "nodejs";
 
-function normalizeRunConfig(input: RunConfig) {
+function normalizeRunConfig(input: RunConfigInput) {
   return {
     ...input,
+    debateMode: normalizeDebateMode(input.debateMode),
     workspacePath: input.workspacePath?.trim() || null,
     participantA: normalizeParticipantConfig(input.participantA),
     participantB: normalizeParticipantConfig(input.participantB),
@@ -35,7 +41,7 @@ export async function POST(request: Request) {
     }
 
     const parsed = runConfigSchema.parse(await request.json());
-    const config = normalizeRunConfig(parsed as RunConfig);
+    const config = normalizeRunConfig(parsed);
 
     if (config.workspaceMode === "path" && !config.workspacePath) {
       return NextResponse.json(

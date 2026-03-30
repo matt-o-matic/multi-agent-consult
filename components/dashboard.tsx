@@ -4,7 +4,18 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useDeferredValue, useEffect, useMemo, useState } from "react";
 
+import {
+  DEBATE_MODE_OPTIONS,
+  getDebateInstructionPlaceholder,
+  getDebateModeLabel,
+  getDebateRoleDescription,
+  getDebateRoleLabel,
+  getDebateRoleTitle,
+  normalizeDebateMode,
+} from "@/lib/debate-mode";
 import type {
+  ActorRole,
+  DebateMode,
   NormalizedModel,
   ParticipantConfig,
   RunConfig,
@@ -28,6 +39,7 @@ interface BuilderRoleSettings {
 interface BuilderFormState {
   taskPrompt: string;
   maxTurns: number;
+  debateMode: DebateMode;
   searchBackend: SearchBackend;
   workspaceMode: WorkspaceMode;
   workspacePath: string;
@@ -89,40 +101,17 @@ const WORKSPACE_OPTIONS: Array<{
   },
 ];
 
-const ROLE_META: Record<
-  RoleField,
-  {
-    eyebrow: string;
-    title: string;
-    description: string;
-    instructionsPlaceholder: string;
+function roleFieldToActorRole(role: RoleField): ActorRole {
+  if (role === "participantA") {
+    return "participant_a";
   }
-> = {
-  participantA: {
-    eyebrow: "Participant A",
-    title: "Initial draft and critique",
-    description:
-      "This model produces its own answer, critiques the opposing answer, and revises when the referee keeps the task open.",
-    instructionsPlaceholder:
-      "Optional role guidance for participant A. Tone, background, risk tolerance, or what to optimize for.",
-  },
-  participantB: {
-    eyebrow: "Participant B",
-    title: "Independent counterweight",
-    description:
-      "Use this model to bring a genuinely different perspective into the room, not a weaker copy of participant A.",
-    instructionsPlaceholder:
-      "Optional role guidance for participant B. This is useful for a different lens, writing taste, or decision style.",
-  },
-  referee: {
-    eyebrow: "Referee",
-    title: "Task planner and convergence judge",
-    description:
-      "The referee decomposes the prompt into tasks, watches the critique loop, and decides when each task has converged.",
-    instructionsPlaceholder:
-      "Optional role guidance for the referee. Keep it evaluative, selective, and meta instead of participatory.",
-  },
-};
+
+  if (role === "participantB") {
+    return "participant_b";
+  }
+
+  return "referee";
+}
 
 function roleCompatibility(role: RoleField, model: NormalizedModel) {
   return role === "referee" ? model.supportsStructuredOutput : model.supportsTools;
@@ -183,6 +172,12 @@ function sanitizeWorkspaceMode(value: unknown, fallback: WorkspaceMode): Workspa
   return value === "off" || value === "path" ? value : fallback;
 }
 
+function sanitizeDebateMode(value: unknown, fallback: DebateMode): DebateMode {
+  return value === "writers_room" || value === "collaborative_debate"
+    ? value
+    : fallback;
+}
+
 function sanitizeTurnCount(value: unknown, fallback: number) {
   if (typeof value !== "number" || !Number.isInteger(value)) {
     return fallback;
@@ -195,6 +190,7 @@ function createDefaultFormState(latestRun?: RunSummary | null): BuilderFormState
   return {
     taskPrompt: "",
     maxTurns: 3,
+    debateMode: normalizeDebateMode(latestRun?.debateMode),
     searchBackend: "off",
     workspaceMode: "off",
     workspacePath: "",
@@ -216,6 +212,7 @@ function createDefaultFormState(latestRun?: RunSummary | null): BuilderFormState
 function toLocalSettings(form: BuilderFormState): BuilderLocalSettings {
   return {
     maxTurns: form.maxTurns,
+    debateMode: form.debateMode,
     searchBackend: form.searchBackend,
     workspaceMode: form.workspaceMode,
     workspacePath: form.workspacePath,
@@ -239,6 +236,7 @@ function readStoredSettings(fallback: BuilderLocalSettings) {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     return {
       maxTurns: sanitizeTurnCount(parsed.maxTurns, fallback.maxTurns),
+      debateMode: sanitizeDebateMode(parsed.debateMode, fallback.debateMode),
       searchBackend: sanitizeSearchBackend(parsed.searchBackend, fallback.searchBackend),
       workspaceMode: sanitizeWorkspaceMode(parsed.workspaceMode, fallback.workspaceMode),
       workspacePath:
@@ -261,6 +259,7 @@ function mergeSettingsIntoForm(
   return {
     ...base,
     maxTurns: settings.maxTurns,
+    debateMode: settings.debateMode,
     searchBackend: settings.searchBackend,
     workspaceMode: settings.workspaceMode,
     workspacePath: settings.workspacePath,
@@ -389,11 +388,20 @@ function buildRunPayload(form: BuilderFormState): RunConfig {
   return {
     taskPrompt: form.taskPrompt.trim(),
     maxTurns: form.maxTurns,
+    debateMode: form.debateMode,
     searchBackend: form.searchBackend,
     workspaceMode: form.workspaceMode,
     workspacePath: form.workspaceMode === "path" ? form.workspacePath.trim() : null,
-    participantA: buildParticipant("participant_a", "Participant A", form.participantA),
-    participantB: buildParticipant("participant_b", "Participant B", form.participantB),
+    participantA: buildParticipant(
+      "participant_a",
+      getDebateRoleLabel(form.debateMode, "participant_a"),
+      form.participantA,
+    ),
+    participantB: buildParticipant(
+      "participant_b",
+      getDebateRoleLabel(form.debateMode, "participant_b"),
+      form.participantB,
+    ),
     referee: buildParticipant("referee", "Referee", form.referee),
   };
 }
@@ -446,6 +454,7 @@ function ModelCapabilities({ model }: { model: NormalizedModel | null }) {
 }
 
 function RoleEditorCard({
+  debateMode,
   filterText,
   matchingCount,
   model,
@@ -457,6 +466,7 @@ function RoleEditorCard({
   quickPicks,
   role,
 }: {
+  debateMode: DebateMode;
   filterText: string;
   matchingCount: number;
   model: NormalizedModel | null;
@@ -468,16 +478,20 @@ function RoleEditorCard({
   quickPicks: NormalizedModel[];
   role: RoleField;
 }) {
-  const meta = ROLE_META[role];
+  const actorRole = roleFieldToActorRole(role);
+  const eyebrow = getDebateRoleLabel(debateMode, actorRole);
+  const title = getDebateRoleTitle(debateMode, actorRole);
+  const description = getDebateRoleDescription(debateMode, actorRole);
+  const instructionsPlaceholder = getDebateInstructionPlaceholder(debateMode, actorRole);
 
   return (
     <article className="rounded-[1.7rem] border border-[var(--line)] bg-white/72 p-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <p className="eyebrow">{meta.eyebrow}</p>
-          <h3 className="mt-2 text-2xl font-semibold">{meta.title}</h3>
+          <p className="eyebrow">{eyebrow}</p>
+          <h3 className="mt-2 text-2xl font-semibold">{title}</h3>
           <p className="mt-3 text-sm leading-7 text-[var(--ink-soft)]">
-            {meta.description}
+            {description}
           </p>
         </div>
         {model ? (
@@ -553,7 +567,7 @@ function RoleEditorCard({
           <textarea
             value={persona}
             onChange={(event) => onPersonaChange(event.target.value)}
-            placeholder={meta.instructionsPlaceholder}
+            placeholder={instructionsPlaceholder}
             className="min-h-40 w-full rounded-[1rem] border border-[var(--line)] bg-white/85 px-4 py-3 outline-none transition focus:border-[var(--accent)]"
           />
           <span className="text-xs leading-5 text-[var(--ink-soft)]">
@@ -578,6 +592,9 @@ function RunHistoryCard({
         <div className="space-y-2">
           <div className="flex flex-wrap items-center gap-2">
             <span className="status-pill rounded-full px-3 py-1 text-xs">{run.status}</span>
+            <span className="status-pill rounded-full px-3 py-1 text-xs">
+              {getDebateModeLabel(run.debateMode)}
+            </span>
             {run.stopReason ? (
               <span className="status-pill rounded-full px-3 py-1 text-xs">
                 {run.stopReason}
@@ -952,6 +969,7 @@ export function Dashboard({ initialRuns }: DashboardProps) {
     setError(null);
     setForm((current) => ({
       ...current,
+      debateMode: normalizeDebateMode(run.debateMode),
       participantA: {
         modelId: run.participantA.modelId,
         persona: run.participantA.persona ?? "",
@@ -1082,7 +1100,7 @@ export function Dashboard({ initialRuns }: DashboardProps) {
                   <div className="text-sm font-medium">Current lineup</div>
                   <div className="mt-3 space-y-2 text-sm leading-6 text-[var(--ink-soft)]">
                     <div>
-                      A:{" "}
+                      {getDebateRoleLabel(form.debateMode, "participant_a")}:{" "}
                       <span className="text-[var(--foreground)]">
                         {displaySelectedModelName(
                           selectedModels.participantA,
@@ -1091,7 +1109,7 @@ export function Dashboard({ initialRuns }: DashboardProps) {
                       </span>
                     </div>
                     <div>
-                      B:{" "}
+                      {getDebateRoleLabel(form.debateMode, "participant_b")}:{" "}
                       <span className="text-[var(--foreground)]">
                         {displaySelectedModelName(
                           selectedModels.participantB,
@@ -1100,12 +1118,18 @@ export function Dashboard({ initialRuns }: DashboardProps) {
                       </span>
                     </div>
                     <div>
-                      Referee:{" "}
+                      {getDebateRoleLabel(form.debateMode, "referee")}:{" "}
                       <span className="text-[var(--foreground)]">
                         {displaySelectedModelName(
                           selectedModels.referee,
                           form.referee.modelId,
                         )}
+                      </span>
+                    </div>
+                    <div>
+                      Mode:{" "}
+                      <span className="text-[var(--foreground)]">
+                        {getDebateModeLabel(form.debateMode)}
                       </span>
                     </div>
                     <div>
@@ -1121,7 +1145,7 @@ export function Dashboard({ initialRuns }: DashboardProps) {
                       </span>
                     </div>
                     <div>
-                      Turn cap:{" "}
+                      Max cycles per milestone:{" "}
                       <span className="text-[var(--foreground)]">{form.maxTurns}</span>
                     </div>
                   </div>
@@ -1174,7 +1198,32 @@ export function Dashboard({ initialRuns }: DashboardProps) {
 
               <div className="mt-6 grid gap-6">
                 <div className="grid gap-3">
-                  <span className="text-sm font-medium">Turn cap</span>
+                  <span className="text-sm font-medium">Mode</span>
+                  <div className="grid gap-3 md:grid-cols-2">
+                    {DEBATE_MODE_OPTIONS.map((option) => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        onClick={() =>
+                          setForm((current) => ({ ...current, debateMode: option.value }))
+                        }
+                        className={
+                          form.debateMode === option.value
+                            ? "rounded-[1.3rem] border border-[var(--accent)] bg-[rgba(196,106,45,0.12)] p-4 text-left"
+                            : "rounded-[1.3rem] border border-[var(--line)] bg-white/78 p-4 text-left"
+                        }
+                      >
+                        <div className="font-medium">{option.label}</div>
+                        <p className="mt-2 text-sm leading-6 text-[var(--ink-soft)]">
+                          {option.description}
+                        </p>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="grid gap-3">
+                  <span className="text-sm font-medium">Max cycles per milestone</span>
                   <div className="flex flex-wrap gap-2">
                     {MAX_TURN_OPTIONS.map((option) => (
                       <button
@@ -1328,6 +1377,7 @@ export function Dashboard({ initialRuns }: DashboardProps) {
 
               <div className="mt-6 space-y-5">
                 <RoleEditorCard
+                  debateMode={form.debateMode}
                   filterText={modelFilters.participantA}
                   matchingCount={participantAOptions.length}
                   model={selectedModels.participantA}
@@ -1342,6 +1392,7 @@ export function Dashboard({ initialRuns }: DashboardProps) {
                   role="participantA"
                 />
                 <RoleEditorCard
+                  debateMode={form.debateMode}
                   filterText={modelFilters.participantB}
                   matchingCount={participantBOptions.length}
                   model={selectedModels.participantB}
@@ -1356,6 +1407,7 @@ export function Dashboard({ initialRuns }: DashboardProps) {
                   role="participantB"
                 />
                 <RoleEditorCard
+                  debateMode={form.debateMode}
                   filterText={modelFilters.referee}
                   matchingCount={refereeRoleOptions.length}
                   model={selectedModels.referee}

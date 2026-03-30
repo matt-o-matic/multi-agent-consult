@@ -13,6 +13,7 @@ const participantSchema = z.object({
 export const runConfigSchema = z.object({
   taskPrompt: z.string().trim().min(1).max(12000),
   maxTurns: z.number().int().min(1).max(6),
+  debateMode: z.enum(["collaborative_debate", "writers_room"]).optional(),
   searchBackend: z.enum(["off", "provider_native", "brave"]),
   workspaceMode: z.enum(["off", "path"]),
   workspacePath: z.string().trim().max(1000).nullish(),
@@ -41,7 +42,7 @@ const answerSchema = z.object({
 });
 
 export const questionBatchAnswerSchema = z.object({
-  answers: z.array(answerSchema).min(1).max(3),
+  answers: z.array(answerSchema).min(1),
 });
 
 export type RunConfigInput = z.infer<typeof runConfigSchema>;

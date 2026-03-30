@@ -5,6 +5,7 @@ import { htmlToText } from "html-to-text";
 
 import { getServerEnv } from "@/lib/env";
 import { getOpenRouterAdapter } from "@/lib/providers/openrouter";
+import { executeChatWithRetry } from "@/lib/services/chat-retry";
 import type { SourceRecord } from "@/lib/types";
 
 const USER_AGENT = "multi-agent-consult/0.1 (+local)";
@@ -73,23 +74,33 @@ export async function braveSearch(query: string) {
   };
 }
 
-export async function openRouterNativeSearch(query: string, modelId: string) {
+export async function openRouterNativeSearch(
+  query: string,
+  modelId: string,
+  signal?: AbortSignal,
+) {
   const adapter = getOpenRouterAdapter();
-  const response = await adapter.createChatStream({
-    modelId,
-    messages: [
-      {
-        role: "system",
-        content:
-          "Search the web for the user's query and return a concise fact-focused summary. Include only supported, current information.",
-      },
-      {
-        role: "user",
-        content: query,
-      },
-    ],
-    plugins: [{ id: "web", engine: "native" }],
-    temperature: 0.1,
+  const response = await executeChatWithRetry({
+    label: `Provider-native search with ${modelId}`,
+    signal,
+    execute: () =>
+      adapter.createChatStream({
+        modelId,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Search the web for the user's query and return a concise fact-focused summary. Include only supported, current information.",
+          },
+          {
+            role: "user",
+            content: query,
+          },
+        ],
+        plugins: [{ id: "web", engine: "native" }],
+        temperature: 0.1,
+        signal,
+      }),
   });
 
   return {

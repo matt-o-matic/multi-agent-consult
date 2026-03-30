@@ -27,7 +27,9 @@ const now = new Date().toISOString();
 const baseRun: RunDetail = {
   activeQuestionBatchId: null,
   createdAt: now,
+  debateMode: "collaborative_debate",
   currentTaskIndex: 1,
+  currentMilestoneTurn: 1,
   currentTurn: 1,
   errorText: null,
   finalConsensus: null,
@@ -59,6 +61,9 @@ const baseRun: RunDetail = {
       id: "decision-1",
       needsUserInput: false,
       preferredDraft: "participant_a",
+      blockingIssues: [],
+      carryForwardNotes: ["Save current-events research for the rewrite milestone."],
+      diminishingReturns: ["Do not spend another cycle on micro style polish."],
       questionBatch: null,
       remainingDisagreements: "None for the critique milestone.",
       requiredNextFocus: "Move to the rewrite milestone.",
@@ -161,9 +166,13 @@ const baseRun: RunDetail = {
   liveState: {
     activeTurns: [
       {
+        attempt: 1,
         content: "",
+        lastError: null,
+        maxAttempts: 3,
         modelId: "alpha",
         phase: "proposal",
+        retryDelayMs: null,
         role: "participant_a",
         startedAt: now,
         turnIndex: 1,
@@ -182,15 +191,125 @@ describe("RunSession", () => {
     expect(html).toContain("Milestone checklist");
     expect(html).toContain("Current milestone");
     expect(html).toContain("Rewrite the draft");
+    expect(html).toContain("Cycle 2 of 3");
     expect(html).toContain("remaining 1");
     expect(html).toContain("completed outputs");
     expect(html).toContain("Proposal or revision");
     expect(html).toContain("Critiques");
     expect(html).toContain("Planning passes");
     expect(html).toContain("Evaluations");
-    expect(html).toContain("Model A is thinking");
-    expect(html).toContain("thinking proposal");
+    expect(html).toContain("Participant A is thinking");
+    expect(html).toContain("thinking proposal, attempt 1 of 3");
     expect(html).toContain("Prompt details");
     expect(html).toContain("Turn history");
+    expect(html).toContain("Carry Forward");
+  });
+
+  it("renders writer and editor labels plus the planning wait state", () => {
+    const html = renderToStaticMarkup(
+      <RunSession
+        initialRun={{
+          ...baseRun,
+          debateMode: "writers_room",
+          status: "waiting_for_user",
+          currentTaskIndex: 0,
+          taskPlan: [],
+          activeQuestionBatchId: "batch-1",
+          participantA: {
+            ...baseRun.participantA,
+            label: "Writer",
+          },
+          participantB: {
+            ...baseRun.participantB,
+            label: "Editor",
+          },
+          questionBatches: [
+            {
+              id: "batch-1",
+              runId: "run-1",
+              status: "pending",
+              questions: [
+                {
+                  id: "question-1",
+                  question: "Who is the audience?",
+                  options: [
+                    {
+                      id: "founders",
+                      label: "Founders",
+                      description: "Target technical founders.",
+                      recommended: true,
+                    },
+                    {
+                      id: "marketers",
+                      label: "Marketers",
+                      description: "Target product and growth teams.",
+                    },
+                  ],
+                },
+              ],
+              createdAt: now,
+              answeredAt: null,
+            },
+          ],
+          liveState: {
+            activeTurns: [
+              {
+                content: "",
+                modelId: "gamma",
+                phase: "planning",
+                role: "referee",
+                startedAt: now,
+                turnIndex: -1,
+                updatedAt: now,
+              },
+            ],
+            latestStatusMessage: "Referee is planning the milestone list.",
+            updatedAt: now,
+          },
+        }}
+      />,
+    );
+
+    expect(html).toContain("Writer&#x27;s room");
+    expect(html).toContain("Writer");
+    expect(html).toContain("Editor");
+    expect(html).toContain("Planning is waiting on user input");
+    expect(html).toContain("The run is paused until this batch is answered");
+  });
+
+  it("renders retrying state and attempt metadata for live lanes", () => {
+    const html = renderToStaticMarkup(
+      <RunSession
+        initialRun={{
+          ...baseRun,
+          liveState: {
+            activeTurns: [
+              {
+                attempt: 2,
+                content: "",
+                lastError:
+                  "OpenRouter completion timed out after 30 seconds without streamed activity.",
+                maxAttempts: 3,
+                modelId: "alpha",
+                phase: "proposal",
+                retryDelayMs: 2000,
+                role: "participant_a",
+                startedAt: now,
+                turnIndex: 1,
+                updatedAt: now,
+              },
+            ],
+            latestStatusMessage:
+              "Participant A proposal attempt 1 failed and is retrying.",
+            updatedAt: now,
+          },
+        }}
+      />,
+    );
+
+    expect(html).toContain("retrying proposal, attempt 2 of 3");
+    expect(html).toContain("backoff 2s");
+    expect(html).toContain("Previous attempt failed");
+    expect(html).toContain("Participant A is retrying");
   });
 });

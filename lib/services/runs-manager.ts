@@ -1,5 +1,6 @@
 import "server-only";
 
+import { normalizeDebateMode } from "@/lib/debate-mode";
 import {
   answerQuestionBatch as persistQuestionBatchAnswers,
   deleteRunArtifactsForRetry,
@@ -14,6 +15,7 @@ import type {
   ParticipantRole,
   RunConfig,
   RunDetail,
+  TurnPhase,
   UserQuestionBatch,
   WorkspaceManifest,
 } from "@/lib/types";
@@ -29,6 +31,7 @@ interface ActiveRunState {
 
 interface RetryPlan {
   carryForwardDecision?: boolean;
+  currentMilestoneTurn: number;
   currentTurn: number;
   currentTaskIndex: number;
   deleteArtifacts?: Parameters<typeof deleteRunArtifactsForRetry>[0];
@@ -39,6 +42,7 @@ function toRunConfig(run: RunDetail): RunConfig {
   return {
     taskPrompt: run.taskPrompt,
     maxTurns: run.maxTurns,
+    debateMode: normalizeDebateMode(run.debateMode),
     searchBackend: run.searchBackend,
     workspaceMode: run.workspacePath ? "path" : "off",
     workspacePath: run.workspacePath ?? null,
@@ -48,9 +52,15 @@ function toRunConfig(run: RunDetail): RunConfig {
   };
 }
 
-function latestParticipantTurn(run: RunDetail, role: ParticipantRole) {
+function latestParticipantTurn(
+  run: RunDetail,
+  role: ParticipantRole,
+  phases?: TurnPhase[],
+) {
   return [...run.turns]
-    .filter((turn) => turn.role === role)
+    .filter(
+      (turn) => turn.role === role && (!phases || phases.includes(turn.phase)),
+    )
     .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
     .at(-1);
 }
@@ -66,14 +76,14 @@ function maxIso(values: Array<string | null | undefined>) {
     .at(-1);
 }
 
-function buildRetryPlan(run: RunDetail): RetryPlan {
+export function buildRetryPlan(run: RunDetail): RetryPlan {
   if (run.status !== "failed") {
     throw new Error("Only failed runs can be retried.");
   }
 
-  if (!hasPlanningTurn(run) || run.taskPlan.length === 0) {
+  if (!hasPlanningTurn(run)) {
     throw new Error(
-      "This failed run is missing its persisted milestone plan. Start a new run instead of retrying this legacy run.",
+      "This failed run is missing its persisted milestone-planning step. Start a new run instead of retrying this legacy run.",
     );
   }
 
@@ -85,19 +95,41 @@ function buildRetryPlan(run: RunDetail): RetryPlan {
     throw new Error("Resolve the pending referee question batch before retrying.");
   }
 
-  const latestA = latestParticipantTurn(run, "participant_a");
-  const latestB = latestParticipantTurn(run, "participant_b");
+  if (run.taskPlan.length === 0) {
+    return {
+      currentMilestoneTurn: run.currentMilestoneTurn,
+      currentTurn: run.currentTurn,
+      currentTaskIndex: run.currentTaskIndex,
+      mode: "turn_loop",
+    };
+  }
+
+  const debateMode = normalizeDebateMode(run.debateMode);
+  const latestDraftA = latestParticipantTurn(run, "participant_a", ["proposal", "revision"]);
+  const latestDraftB = latestParticipantTurn(run, "participant_b", ["proposal", "revision"]);
+  const latestCritiqueA = latestParticipantTurn(run, "participant_a", ["critique"]);
+  const latestCritiqueB = latestParticipantTurn(run, "participant_b", ["critique"]);
   const lastDecision = run.refereeDecisions.at(-1) ?? null;
+  const isFinalMilestone =
+    run.taskPlan.length > 0 && run.currentTaskIndex === run.taskPlan.length - 1;
   const canRetryFinalSynthesis =
+    isFinalMilestone &&
     !!lastDecision &&
-    !!latestA &&
-    !!latestB &&
-    latestA.turnIndex === lastDecision.turnIndex &&
-    latestB.turnIndex === lastDecision.turnIndex &&
-    (lastDecision.converged || lastDecision.turnIndex === run.maxTurns - 1);
+    !!latestDraftA &&
+    (debateMode === "writers_room" ? true : !!latestDraftB) &&
+    (debateMode === "writers_room" ? true : !!latestCritiqueA) &&
+    !!latestCritiqueB &&
+    latestDraftA.turnIndex === lastDecision.turnIndex &&
+    (debateMode === "writers_room" ||
+      latestDraftB!.turnIndex === lastDecision.turnIndex) &&
+    (debateMode === "writers_room" ||
+      latestCritiqueA!.turnIndex === lastDecision.turnIndex) &&
+    latestCritiqueB.turnIndex === lastDecision.turnIndex &&
+    (lastDecision.converged || run.currentMilestoneTurn >= run.maxTurns - 1);
 
   if (canRetryFinalSynthesis) {
     return {
+      currentMilestoneTurn: run.currentMilestoneTurn,
       currentTurn: lastDecision.turnIndex,
       currentTaskIndex: run.currentTaskIndex,
       mode: "final_synthesis",
@@ -159,6 +191,7 @@ function buildRetryPlan(run: RunDetail): RetryPlan {
 
   return {
     carryForwardDecision: stableDecisions.at(-1)?.converged ? false : stableDecisions.length > 0,
+    currentMilestoneTurn: run.currentMilestoneTurn,
     currentTurn: restartTurnIndex,
     currentTaskIndex: run.currentTaskIndex,
     deleteArtifacts: {
@@ -210,6 +243,7 @@ class RunsManager {
     }
 
     await prepareRunForRetry(runId, {
+      currentMilestoneTurn: plan.currentMilestoneTurn,
       currentTurn: plan.currentTurn,
       currentTaskIndex: plan.currentTaskIndex,
     });

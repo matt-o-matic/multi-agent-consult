@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ProviderChatError } from "@/lib/providers/base";
 import { OpenRouterAdapter } from "@/lib/providers/openrouter";
 import type { ProviderChatRequest } from "@/lib/providers/base";
 import type { RunConfig } from "@/lib/types";
@@ -219,6 +220,48 @@ describe("OpenRouterAdapter.createChatStream", () => {
     await failure;
   });
 
+  it("classifies 429 responses as retryable and honors Retry-After", async () => {
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(
+        new Response("rate limited", {
+          status: 429,
+          headers: {
+            "Retry-After": "12",
+          },
+        }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const adapter = new OpenRouterAdapter();
+
+    await expect(adapter.createChatStream(createRequest())).rejects.toMatchObject({
+      kind: "rate_limited",
+      retryAfterMs: 12_000,
+      retryable: true,
+      statusCode: 429,
+    } satisfies Partial<ProviderChatError>);
+  });
+
+  it("does not mark 400 responses as retryable", async () => {
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(
+        new Response("bad request", {
+          status: 400,
+        }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const adapter = new OpenRouterAdapter();
+
+    await expect(adapter.createChatStream(createRequest())).rejects.toMatchObject({
+      kind: "invalid_request",
+      retryable: false,
+      statusCode: 400,
+    } satisfies Partial<ProviderChatError>);
+  });
+
   it("times out after 30 seconds without streamed activity once the stream has started", async () => {
     const fetchMock = vi.fn((_, init?: RequestInit) => {
       return Promise.resolve(
@@ -316,6 +359,54 @@ describe("OpenRouterAdapter.createChatStream", () => {
       },
     ]);
     expect(response.usage?.totalTokens).toBe(42);
+  });
+
+  it("treats invalid streamed JSON payloads as retryable stream errors", async () => {
+    const fetchMock = vi.fn((_, init?: RequestInit) => {
+      return Promise.resolve(
+        createStreamingResponse(init?.signal as AbortSignal, [
+          {
+            atMs: 0,
+            chunk: sseEvent("{not-json"),
+          },
+        ]),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const adapter = new OpenRouterAdapter();
+
+    const responsePromise = adapter.createChatStream(createRequest());
+    const failure = expect(responsePromise).rejects.toMatchObject({
+      kind: "sse_truncated",
+      retryable: true,
+    } satisfies Partial<ProviderChatError>);
+    await vi.runAllTimersAsync();
+    await failure;
+  });
+
+  it("treats empty streamed completions as retryable", async () => {
+    const fetchMock = vi.fn((_, init?: RequestInit) => {
+      return Promise.resolve(
+        createStreamingResponse(init?.signal as AbortSignal, [
+          {
+            atMs: 0,
+            chunk: sseEvent("[DONE]"),
+            closeAfter: true,
+          },
+        ]),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const adapter = new OpenRouterAdapter();
+    const responsePromise = adapter.createChatStream(createRequest());
+    const failure = expect(responsePromise).rejects.toMatchObject({
+      kind: "empty_response",
+      retryable: true,
+    } satisfies Partial<ProviderChatError>);
+    await vi.runAllTimersAsync();
+    await failure;
   });
 
   it("allows a stream with regular activity to run well past four minutes", async () => {

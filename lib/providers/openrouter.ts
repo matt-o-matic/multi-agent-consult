@@ -8,9 +8,11 @@ import type {
 } from "@/lib/types";
 import type {
   ProviderAdapter,
+  ProviderChatErrorKind,
   ProviderChatRequest,
   ProviderChatResponse,
 } from "@/lib/providers/base";
+import { ProviderChatError } from "@/lib/providers/base";
 
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -236,8 +238,95 @@ function parseToolCalls(toolCalls: unknown) {
   });
 }
 
-function timeoutError(message: string) {
-  return new Error(message);
+function parseRetryAfterMs(headers: Headers) {
+  const retryAfter = headers.get("retry-after");
+  if (!retryAfter) {
+    return undefined;
+  }
+
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return seconds * 1000;
+  }
+
+  const asDate = Date.parse(retryAfter);
+  if (Number.isNaN(asDate)) {
+    return undefined;
+  }
+
+  return Math.max(0, asDate - Date.now());
+}
+
+function providerChatError(args: {
+  cause?: unknown;
+  kind: ProviderChatErrorKind;
+  message: string;
+  retryAfterMs?: number;
+  retryable: boolean;
+  statusCode?: number;
+}) {
+  return new ProviderChatError(args);
+}
+
+function timeoutError(
+  kind: Extract<ProviderChatErrorKind, "timeout_first_activity" | "timeout_idle">,
+  message: string,
+) {
+  return providerChatError({
+    kind,
+    message,
+    retryable: true,
+  });
+}
+
+function classifyStatusError(response: Response, errorText: string) {
+  const message = `OpenRouter completion failed: ${response.status} ${errorText}`.trim();
+  const retryAfterMs = parseRetryAfterMs(response.headers);
+
+  if ([408, 409, 425, 500, 502, 503, 504].includes(response.status)) {
+    return providerChatError({
+      kind: "provider_unavailable",
+      message,
+      retryAfterMs,
+      retryable: true,
+      statusCode: response.status,
+    });
+  }
+
+  if (response.status === 429) {
+    return providerChatError({
+      kind: "rate_limited",
+      message,
+      retryAfterMs,
+      retryable: true,
+      statusCode: response.status,
+    });
+  }
+
+  if (response.status === 404) {
+    return providerChatError({
+      kind: "not_found",
+      message,
+      retryable: false,
+      statusCode: response.status,
+    });
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    return providerChatError({
+      kind: "auth",
+      message,
+      retryable: false,
+      statusCode: response.status,
+    });
+  }
+
+  return providerChatError({
+    kind: "invalid_request",
+    message,
+    retryable: false,
+    statusCode: response.status,
+  });
 }
 
 function createStreamTimeoutController(requestSignal?: AbortSignal) {
@@ -246,9 +335,13 @@ function createStreamTimeoutController(requestSignal?: AbortSignal) {
     ? AbortSignal.any([requestSignal, controller.signal])
     : controller.signal;
   let timer: ReturnType<typeof setTimeout> | null = null;
-  let lastTimeoutError: Error | null = null;
+  let lastTimeoutError: ProviderChatError | null = null;
 
-  const arm = (delayMs: number, message: string) => {
+  const arm = (
+    delayMs: number,
+    message: string,
+    kind: Extract<ProviderChatErrorKind, "timeout_first_activity" | "timeout_idle">,
+  ) => {
     if (timer) {
       clearTimeout(timer);
     }
@@ -258,7 +351,7 @@ function createStreamTimeoutController(requestSignal?: AbortSignal) {
         return;
       }
 
-      lastTimeoutError = timeoutError(message);
+      lastTimeoutError = timeoutError(kind, message);
       controller.abort(lastTimeoutError);
     }, delayMs);
   };
@@ -268,6 +361,7 @@ function createStreamTimeoutController(requestSignal?: AbortSignal) {
     `OpenRouter completion timed out waiting for first streamed activity after ${
       OPENROUTER_FIRST_ACTIVITY_TIMEOUT_MS / 1000
     } seconds.`,
+    "timeout_first_activity",
   );
 
   return {
@@ -283,6 +377,7 @@ function createStreamTimeoutController(requestSignal?: AbortSignal) {
         `OpenRouter completion timed out after ${
           OPENROUTER_STREAM_IDLE_TIMEOUT_MS / 1000
         } seconds without streamed activity.`,
+        "timeout_idle",
       );
     },
     signal,
@@ -415,9 +510,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
 
       if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(
-          `OpenRouter completion failed: ${response.status} ${errorText}`,
-        );
+        throw classifyStatusError(response, errorText);
       }
 
       if (!response.body) {
@@ -437,13 +530,22 @@ export class OpenRouterAdapter implements ProviderAdapter {
         const choice = payload.choices?.[0]?.message;
         const rawAnnotations = choice?.annotations;
         const content = parseContent(choice?.content);
+        const toolCalls = parseToolCalls(choice?.tool_calls);
         if (content) {
           request.onTextDelta?.({ delta: content, content });
         }
 
+        if (!content.trim() && toolCalls.length === 0) {
+          throw providerChatError({
+            kind: "empty_response",
+            message: "OpenRouter returned an empty completion.",
+            retryable: true,
+          });
+        }
+
         return {
           content,
-          toolCalls: parseToolCalls(choice?.tool_calls),
+          toolCalls,
           usage: toUsage(payload.usage),
           sources: this.normalizeSources(rawAnnotations),
           rawAnnotations,
@@ -493,10 +595,24 @@ export class OpenRouterAdapter implements ProviderAdapter {
             break;
           }
 
-          const chunk = JSON.parse(payload) as OpenRouterStreamChunk;
+          let chunk: OpenRouterStreamChunk;
+          try {
+            chunk = JSON.parse(payload) as OpenRouterStreamChunk;
+          } catch (error) {
+            throw providerChatError({
+              cause: error,
+              kind: "sse_truncated",
+              message: "OpenRouter returned an invalid or truncated stream payload.",
+              retryable: true,
+            });
+          }
           timeoutController.markActivity();
           if (chunk.error?.message) {
-            throw new Error(chunk.error.message);
+            throw providerChatError({
+              kind: "provider_unavailable",
+              message: chunk.error.message,
+              retryable: true,
+            });
           }
 
           usage = toUsage(chunk.usage) ?? usage;
@@ -524,18 +640,46 @@ export class OpenRouterAdapter implements ProviderAdapter {
         }
       }
 
+      if (!isDone && buffer.trim().length > 0) {
+        throw providerChatError({
+          kind: "sse_truncated",
+          message: "OpenRouter stream ended before the final event completed.",
+          retryable: true,
+        });
+      }
+
+      const finalizedToolCalls = finalizeStreamingToolCalls(toolCallAccumulators);
+      const normalizedSources = this.normalizeSources(rawAnnotations);
+      if (
+        !content.trim() &&
+        finalizedToolCalls.length === 0 &&
+        normalizedSources.length === 0
+      ) {
+        throw providerChatError({
+          kind: "empty_response",
+          message: "OpenRouter returned an empty streamed completion.",
+          retryable: true,
+        });
+      }
+
       return {
         content,
-        toolCalls: finalizeStreamingToolCalls(toolCallAccumulators),
+        toolCalls: finalizedToolCalls,
         usage,
-        sources: this.normalizeSources(rawAnnotations),
+        sources: normalizedSources,
         rawAnnotations,
       };
     } catch (error) {
       if (request.signal?.aborted) {
-        throw request.signal.reason instanceof Error
-          ? request.signal.reason
-          : new Error("Run cancelled.");
+        throw providerChatError({
+          cause: request.signal.reason,
+          kind: "cancelled",
+          message:
+            request.signal.reason instanceof Error
+              ? request.signal.reason.message
+              : "Run cancelled.",
+          retryable: false,
+        });
       }
 
       const timedOut = timeoutController.timedOut();
@@ -543,7 +687,19 @@ export class OpenRouterAdapter implements ProviderAdapter {
         throw timedOut;
       }
 
-      throw error;
+      if (error instanceof ProviderChatError) {
+        throw error;
+      }
+
+      throw providerChatError({
+        cause: error,
+        kind: "transport",
+        message:
+          error instanceof Error
+            ? `OpenRouter completion transport failed: ${error.message}`
+            : "OpenRouter completion transport failed.",
+        retryable: true,
+      });
     } finally {
       timeoutController.dispose();
     }

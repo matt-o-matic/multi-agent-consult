@@ -27,6 +27,7 @@ export interface ToolExecutionContext {
   role: ParticipantRole;
   modelId: string;
   searchBackend: SearchBackend;
+  signal?: AbortSignal;
   workspaceManifest?: WorkspaceManifest | null;
 }
 
@@ -151,7 +152,6 @@ export const participantToolDefinitions: ProviderToolDefinition[] = [
           questions: {
             type: "array",
             minItems: 1,
-            maxItems: 3,
             items: {
               type: "object",
               properties: {
@@ -189,6 +189,143 @@ export const participantToolDefinitions: ProviderToolDefinition[] = [
 
 function serializeToolContent(payload: unknown) {
   return JSON.stringify(payload, null, 2);
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeQuestionPromptText(value: unknown) {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function slugifyQuestionOptionId(value: string, fallback: string) {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return normalized || fallback;
+}
+
+function normalizeQuestionProposalOptions(input: unknown): UserQuestionProposal["options"] {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+
+  const normalizedOptions: UserQuestionProposal["options"] = [];
+  const usedIds = new Set<string>();
+
+  for (const [index, option] of input.entries()) {
+    let normalizedOption: UserQuestionProposal["options"][number] | null = null;
+
+    if (typeof option === "string") {
+      const label = option.trim();
+      if (label) {
+        normalizedOption = {
+          id: slugifyQuestionOptionId(label, `option-${index + 1}`),
+          label,
+          description: label,
+          recommended: false,
+        };
+      }
+    } else if (isObjectRecord(option)) {
+      const label =
+        (typeof option.label === "string" && option.label.trim()) ||
+        (typeof option.description === "string" && option.description.trim()) ||
+        (typeof option.id === "string" && option.id.trim()) ||
+        `Option ${index + 1}`;
+      const description =
+        typeof option.description === "string" && option.description.trim()
+          ? option.description.trim()
+          : label;
+
+      normalizedOption = {
+        id: slugifyQuestionOptionId(
+          typeof option.id === "string" && option.id.trim() ? option.id.trim() : label,
+          `option-${index + 1}`,
+        ),
+        label,
+        description,
+        recommended: option.recommended === true,
+      };
+    }
+
+    if (!normalizedOption) {
+      continue;
+    }
+
+    let uniqueId = normalizedOption.id;
+    let suffix = 2;
+
+    while (usedIds.has(uniqueId)) {
+      uniqueId = `${normalizedOption.id}-${suffix}`;
+      suffix += 1;
+    }
+
+    usedIds.add(uniqueId);
+    normalizedOptions.push({
+      ...normalizedOption,
+      id: uniqueId,
+    });
+  }
+
+  return normalizedOptions;
+}
+
+function normalizeQuestionProposals(input: unknown): UserQuestionProposal[] {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+
+  const normalizedProposals: UserQuestionProposal[] = [];
+
+  for (const proposal of input) {
+    if (!isObjectRecord(proposal)) {
+      continue;
+    }
+
+    const question =
+      normalizeQuestionPromptText(proposal.question) ??
+      normalizeQuestionPromptText(proposal.prompt) ??
+      normalizeQuestionPromptText(proposal.title) ??
+      normalizeQuestionPromptText(proposal.header) ??
+      normalizeQuestionPromptText(proposal.text);
+
+    if (!question) {
+      continue;
+    }
+
+    const options = normalizeQuestionProposalOptions(proposal.options);
+    if (options.length < 2) {
+      continue;
+    }
+
+    normalizedProposals.push({
+      id:
+        typeof proposal.id === "string" && proposal.id.trim()
+          ? proposal.id.trim()
+          : crypto.randomUUID(),
+      question,
+      rationale:
+        typeof proposal.rationale === "string" && proposal.rationale.trim()
+          ? proposal.rationale.trim()
+          : undefined,
+      notePlaceholder:
+        typeof proposal.notePlaceholder === "string" && proposal.notePlaceholder.trim()
+          ? proposal.notePlaceholder.trim()
+          : undefined,
+      options,
+    });
+  }
+
+  return normalizedProposals;
 }
 
 function baseInvocation(
@@ -232,7 +369,7 @@ export async function executeTool(
         const searchResult =
           context.searchBackend === "brave"
             ? await braveSearch(query)
-            : await openRouterNativeSearch(query, context.modelId);
+            : await openRouterNativeSearch(query, context.modelId, context.signal);
 
         payload = {
           summary: searchResult.summary,
@@ -304,10 +441,7 @@ export async function executeTool(
         break;
       }
       case "propose_user_questions": {
-        const questions = Array.isArray(input.questions)
-          ? (input.questions as UserQuestionProposal[])
-          : [];
-        questionProposals = questions.slice(0, 3);
+        questionProposals = normalizeQuestionProposals(input.questions);
         payload = {
           questions: questionProposals,
           note:

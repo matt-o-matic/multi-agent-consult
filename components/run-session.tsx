@@ -13,6 +13,7 @@ import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 
+import { getDebateModeLabel, getDebateOutputLabels } from "@/lib/debate-mode";
 import type {
   ActorRole,
   RefereeDecision,
@@ -29,9 +30,13 @@ interface RunSessionProps {
 }
 
 interface LiveTurn {
+  attempt?: number;
   content: string;
+  lastError?: string | null;
+  maxAttempts?: number;
   modelId: string;
   phase: TurnPhase;
+  retryDelayMs?: number | null;
   role: ActorRole;
   startedAt: string;
   turnIndex: number;
@@ -56,6 +61,9 @@ interface RefereeDecisionViewModel
     | "remainingDisagreements"
     | "needsUserInput"
   > {
+  blockingIssues: string[];
+  carryForwardNotes: string[];
+  diminishingReturns: string[];
   questionBatch: QuestionBatchPreview | null;
 }
 
@@ -69,9 +77,13 @@ function toLiveTurnMap(activeTurns?: RunLiveState["activeTurns"] | null) {
     (activeTurns ?? []).map((turn) => [
       liveTurnKey(turn.role, turn.phase, turn.turnIndex),
       {
+        attempt: turn.attempt,
         content: turn.content,
+        lastError: turn.lastError ?? null,
+        maxAttempts: turn.maxAttempts,
         modelId: turn.modelId,
         phase: turn.phase,
+        retryDelayMs: turn.retryDelayMs ?? null,
         role: turn.role,
         startedAt: turn.startedAt,
         turnIndex: turn.turnIndex,
@@ -93,6 +105,10 @@ function groupSourcesByTurn(run: RunDetail) {
     map.set(source.turnId, existing);
   }
   return map;
+}
+
+function currentMilestoneStartTurn(run: RunDetail) {
+  return Math.max(0, run.currentTurn - run.currentMilestoneTurn);
 }
 
 function liveTurnKey(role: ActorRole, phase: TurnPhase, turnIndex: number) {
@@ -161,6 +177,15 @@ function parseRefereeDecision(content: string): RefereeDecisionViewModel | null 
           : "tie",
       requiredNextFocus: parsed.requiredNextFocus,
       remainingDisagreements: parsed.remainingDisagreements,
+      blockingIssues: Array.isArray(parsed.blockingIssues)
+        ? parsed.blockingIssues.filter((value): value is string => typeof value === "string")
+        : [],
+      carryForwardNotes: Array.isArray(parsed.carryForwardNotes)
+        ? parsed.carryForwardNotes.filter((value): value is string => typeof value === "string")
+        : [],
+      diminishingReturns: Array.isArray(parsed.diminishingReturns)
+        ? parsed.diminishingReturns.filter((value): value is string => typeof value === "string")
+        : [],
       needsUserInput: parsed.needsUserInput,
       questionBatch,
     };
@@ -178,6 +203,9 @@ function toRefereeDecisionViewModel(
     | "preferredDraft"
     | "requiredNextFocus"
     | "remainingDisagreements"
+    | "blockingIssues"
+    | "carryForwardNotes"
+    | "diminishingReturns"
     | "needsUserInput"
     | "questionBatch"
   >,
@@ -189,6 +217,9 @@ function toRefereeDecisionViewModel(
     preferredDraft: decision.preferredDraft,
     requiredNextFocus: decision.requiredNextFocus,
     remainingDisagreements: decision.remainingDisagreements,
+    blockingIssues: decision.blockingIssues ?? [],
+    carryForwardNotes: decision.carryForwardNotes ?? [],
+    diminishingReturns: decision.diminishingReturns ?? [],
     needsUserInput: decision.needsUserInput,
     questionBatch: decision.questionBatch
       ? {
@@ -254,6 +285,24 @@ function latestPersistedTurn(turns: RunDetail["turns"], role: ActorRole) {
     .at(-1) ?? null;
 }
 
+function latestEvidenceTurnForRole(args: {
+  role: ActorRole;
+  run: RunDetail;
+  sourcesByTurn: Map<string, SourceRecord[]>;
+}) {
+  const milestoneStart = currentMilestoneStartTurn(args.run);
+
+  return [...args.run.turns]
+    .filter(
+      (turn) =>
+        turn.role === args.role &&
+        turn.turnIndex >= milestoneStart &&
+        (args.sourcesByTurn.get(turn.id)?.length ?? 0) > 0,
+    )
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+    .at(-1) ?? null;
+}
+
 function latestLiveTurn(liveTurns: Record<string, LiveTurn>, role: ActorRole) {
   return Object.values(liveTurns)
     .filter((turn) => turn.role === role)
@@ -276,16 +325,12 @@ function isActiveRunStatus(status: RunDetail["status"]) {
   return ["queued", "running", "waiting_for_user"].includes(status);
 }
 
-function formatRoleName(role: ActorRole) {
-  if (role === "participant_a") {
-    return "Model A";
-  }
-
-  if (role === "participant_b") {
-    return "Model B";
-  }
-
-  return "Referee";
+function getRoleLabels(run: Pick<RunDetail, "participantA" | "participantB" | "referee">) {
+  return {
+    participant_a: run.participantA.label,
+    participant_b: run.participantB.label,
+    referee: run.referee.label,
+  } satisfies Record<ActorRole, string>;
 }
 
 function formatPhaseName(phase: TurnPhase) {
@@ -392,41 +437,77 @@ function buildActivityState(args: {
   runStatus: RunDetail["status"];
 }) {
   if (args.liveTurn) {
+    const attemptDetail =
+      typeof args.liveTurn.attempt === "number" &&
+      typeof args.liveTurn.maxAttempts === "number"
+        ? `attempt ${args.liveTurn.attempt} of ${args.liveTurn.maxAttempts}`
+        : null;
+
+    if (
+      typeof args.liveTurn.retryDelayMs === "number" &&
+      args.liveTurn.lastError
+    ) {
+      return {
+        attemptDetail,
+        detail: `retrying ${formatPhaseName(args.liveTurn.phase)}`,
+        isActive: true,
+        isStreaming: false,
+        label: "retrying",
+        lastError: args.liveTurn.lastError,
+        retryDelayLabel:
+          args.liveTurn.retryDelayMs > 0
+            ? `backoff ${Math.ceil(args.liveTurn.retryDelayMs / 1000)}s`
+            : "retrying now",
+      };
+    }
+
     const hasContent = args.liveTurn.content.trim().length > 0;
     const verb = hasContent ? "streaming" : "thinking";
     const elapsed = args.now ? ` for ${formatElapsed(args.liveTurn.startedAt, args.now)}` : "";
 
     return {
+      attemptDetail,
       detail: `${verb} ${formatPhaseName(args.liveTurn.phase)}${elapsed}`,
       isActive: true,
       isStreaming: hasContent,
       label: verb,
+      lastError: null,
+      retryDelayLabel: null,
     };
   }
 
   if (args.runStatus === "waiting_for_user") {
     return {
+      attemptDetail: null,
       detail: "paused for user input",
       isActive: false,
       isStreaming: false,
       label: "paused",
+      lastError: null,
+      retryDelayLabel: null,
     };
   }
 
   if (isActiveRunStatus(args.runStatus)) {
     return {
+      attemptDetail: null,
       detail: "idle",
       isActive: false,
       isStreaming: false,
       label: "idle",
+      lastError: null,
+      retryDelayLabel: null,
     };
   }
 
   return {
+    attemptDetail: null,
     detail: "idle",
     isActive: false,
     isStreaming: false,
     label: "idle",
+    lastError: null,
+    retryDelayLabel: null,
   };
 }
 
@@ -530,6 +611,43 @@ function RefereeDecisionCard({
           </p>
         </div>
       </div>
+
+      {decision.blockingIssues.length ||
+      decision.carryForwardNotes.length ||
+      decision.diminishingReturns.length ? (
+        <div className={compact ? "grid gap-3" : "grid gap-4 md:grid-cols-3"}>
+          <div className="rounded-[1.1rem] border border-[var(--line)] bg-white/80 p-4">
+            <div className="eyebrow">Blocking Now</div>
+            <ul className="mt-3 space-y-2 text-sm leading-6 text-[var(--foreground)]">
+              {decision.blockingIssues.length ? (
+                decision.blockingIssues.map((issue, index) => <li key={`block-${index}`}>{issue}</li>)
+              ) : (
+                <li className="text-[var(--ink-soft)]">No blocking issues.</li>
+              )}
+            </ul>
+          </div>
+          <div className="rounded-[1.1rem] border border-[var(--line)] bg-white/80 p-4">
+            <div className="eyebrow">Carry Forward</div>
+            <ul className="mt-3 space-y-2 text-sm leading-6 text-[var(--foreground)]">
+              {decision.carryForwardNotes.length ? (
+                decision.carryForwardNotes.map((note, index) => <li key={`carry-${index}`}>{note}</li>)
+              ) : (
+                <li className="text-[var(--ink-soft)]">No carry-forward notes.</li>
+              )}
+            </ul>
+          </div>
+          <div className="rounded-[1.1rem] border border-[var(--line)] bg-white/80 p-4">
+            <div className="eyebrow">Diminishing Returns</div>
+            <ul className="mt-3 space-y-2 text-sm leading-6 text-[var(--foreground)]">
+              {decision.diminishingReturns.length ? (
+                decision.diminishingReturns.map((item, index) => <li key={`dim-${index}`}>{item}</li>)
+              ) : (
+                <li className="text-[var(--ink-soft)]">No diminishing-return notes.</li>
+              )}
+            </ul>
+          </div>
+        </div>
+      ) : null}
 
       {decision.questionBatch?.questions?.length ? (
         <div className="rounded-[1.1rem] border border-[var(--line)] bg-white/80 p-4">
@@ -637,15 +755,22 @@ function TaskPlanCard({
 
 function MilestoneOverviewCard({
   currentTaskIndex,
+  currentMilestoneTurn,
+  maxMilestoneTurns,
+  pendingBatch,
   runStatus,
   taskPlan,
 }: {
   currentTaskIndex: number;
+  currentMilestoneTurn: number;
+  maxMilestoneTurns: number;
+  pendingBatch: NonNullable<RunDetail["questionBatches"][number]> | null;
   runStatus: RunDetail["status"];
   taskPlan: RunDetail["taskPlan"];
 }) {
   const currentMilestone = getCurrentMilestone(taskPlan, currentTaskIndex, runStatus);
   const remainingMilestones = getRemainingMilestoneCount(taskPlan, currentTaskIndex, runStatus);
+  const planningPaused = !currentMilestone && !!pendingBatch;
 
   return (
     <section className="panel rounded-[2rem] p-6 lg:col-span-2" data-testid="milestone-overview">
@@ -659,6 +784,9 @@ function MilestoneOverviewCard({
             total {taskPlan.length}
           </span>
           <span className="status-pill rounded-full px-3 py-1 text-xs">
+            cycle {currentMilestoneTurn + 1} of {maxMilestoneTurns}
+          </span>
+          <span className="status-pill rounded-full px-3 py-1 text-xs">
             remaining {remainingMilestones}
           </span>
         </div>
@@ -668,13 +796,18 @@ function MilestoneOverviewCard({
         <div className="mt-4 rounded-[1.3rem] border border-[var(--line)] bg-white/75 p-4">
           <div className="eyebrow">Current milestone</div>
           <h3 className="mt-2 text-lg font-semibold">{currentMilestone.title}</h3>
+          <div className="mt-2 text-sm font-medium text-[var(--ink-soft)]">
+            Cycle {currentMilestoneTurn + 1} of {maxMilestoneTurns}
+          </div>
           <p className="mt-2 text-sm leading-6 text-[var(--foreground)]">
             {currentMilestone.objective}
           </p>
         </div>
       ) : (
         <div className="mt-4 rounded-[1.3rem] border border-dashed border-[var(--line)] px-4 py-5 text-sm text-[var(--ink-soft)]">
-          The referee is still planning the milestones.
+          {planningPaused
+            ? "Planning is waiting on user input before the milestone list can be finalized."
+            : "The referee is still planning the milestones."}
         </div>
       )}
 
@@ -691,23 +824,25 @@ function MilestoneOverviewCard({
 function ThinkingState({
   detail,
   phase,
-  role,
+  roleLabel,
+  stateLabel,
 }: {
   detail: string;
   phase: TurnPhase;
-  role: ActorRole;
+  roleLabel: string;
+  stateLabel: string;
 }) {
   return (
     <div className="rounded-[1rem] border border-dashed border-[var(--line)] bg-white/70 px-4 py-6 text-sm text-[var(--ink-soft)]">
       <div className="flex items-center gap-3">
-        <span className="thinking-indicator" aria-hidden="true">
-          <span className="thinking-orb" />
-          <span className="thinking-orb" />
-          <span className="thinking-orb" />
-        </span>
+          <span className="thinking-indicator" aria-hidden="true">
+            <span className="thinking-orb" />
+            <span className="thinking-orb" />
+            <span className="thinking-orb" />
+          </span>
         <div>
           <div className="font-medium text-[var(--foreground)]">
-            {formatRoleName(role)} is thinking
+            {roleLabel} is {stateLabel}
           </div>
           <div className="mt-1">
             {formatPhaseName(phase)} in progress. {detail}
@@ -725,7 +860,8 @@ function RoleSummaryCard({
   now,
   primaryLabel,
   primaryValue,
-  role,
+  roleLabel,
+  roleTestId,
   runStatus,
   secondaryLabel,
   secondaryValue,
@@ -736,7 +872,8 @@ function RoleSummaryCard({
   now: number | null;
   primaryLabel: string;
   primaryValue: number;
-  role: ActorRole;
+  roleLabel: string;
+  roleTestId: ActorRole;
   runStatus: RunDetail["status"];
   secondaryLabel: string;
   secondaryValue: number;
@@ -748,14 +885,16 @@ function RoleSummaryCard({
   });
 
   return (
-    <section className="panel rounded-[2rem] p-6" data-testid={`summary-${role}`}>
+    <section className="panel rounded-[2rem] p-6" data-testid={`summary-${roleTestId}`}>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <p className="eyebrow">{formatRoleName(role)}</p>
+          <p className="eyebrow">{roleLabel}</p>
           <h2 className="mt-1 text-lg font-semibold break-all">{modelId}</h2>
         </div>
         <span className="status-pill rounded-full px-3 py-1 text-xs">
-          {activity.detail}
+          {activity.attemptDetail
+            ? `${activity.detail}, ${activity.attemptDetail}`
+            : activity.detail}
         </span>
       </div>
 
@@ -853,11 +992,13 @@ function PromptCard({ prompt }: { prompt: string }) {
 
 function RefereeMilestoneCard({
   currentTaskIndex,
+  pendingBatch,
   previewTaskPlan,
   runStatus,
   taskPlan,
 }: {
   currentTaskIndex: number;
+  pendingBatch: NonNullable<RunDetail["questionBatches"][number]> | null;
   previewTaskPlan: RunDetail["taskPlan"] | null;
   runStatus: RunDetail["status"];
   taskPlan: RunDetail["taskPlan"];
@@ -886,7 +1027,9 @@ function RefereeMilestoneCard({
         </>
       ) : (
         <p className="mt-2 text-sm leading-6 text-[var(--ink-soft)]">
-          Waiting for milestone planning.
+          {pendingBatch
+            ? "Planning is waiting on user input."
+            : "Waiting for milestone planning."}
         </p>
       )}
     </div>
@@ -895,26 +1038,40 @@ function RefereeMilestoneCard({
 
 function LiveRolePanel({
   currentTaskIndex,
+  currentMilestoneTurn,
+  evidenceSources,
   latestDecision,
   liveTurn,
+  maxMilestoneTurns,
   modelId,
   now,
   role,
+  roleLabel,
   runStatus,
+  sharedEvidenceLabel,
+  sharedEvidenceSources,
   statusMessage,
   taskPlan,
   turn,
+  pendingBatch,
 }: {
   currentTaskIndex: number;
+  currentMilestoneTurn: number;
+  evidenceSources: SourceRecord[];
   latestDecision: RefereeDecisionViewModel | null;
   liveTurn: LiveTurn | null;
+  maxMilestoneTurns: number;
   modelId: string;
   now: number | null;
   role: ActorRole;
+  roleLabel: string;
   runStatus: RunDetail["status"];
+  sharedEvidenceLabel?: string | null;
+  sharedEvidenceSources: SourceRecord[];
   statusMessage: string | null;
   taskPlan: RunDetail["taskPlan"];
   turn: RunDetail["turns"][number] | null;
+  pendingBatch: NonNullable<RunDetail["questionBatches"][number]> | null;
 }) {
   const contentRef = useRef<HTMLDivElement>(null);
   const previewTaskPlan =
@@ -941,7 +1098,7 @@ function LiveRolePanel({
     <section className="panel rounded-[2rem] p-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <p className="eyebrow">{formatRoleName(role)}</p>
+          <p className="eyebrow">{roleLabel}</p>
           <h2 className="mt-1 text-xl font-semibold">{modelId}</h2>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -954,9 +1111,18 @@ function LiveRolePanel({
                   <span className="thinking-orb" />
                 </span>
               ) : null}
-              <span>{activity.detail}</span>
+              <span>
+                {activity.attemptDetail
+                  ? `${activity.detail}, ${activity.attemptDetail}`
+                  : activity.detail}
+              </span>
             </span>
           </span>
+          {activity.retryDelayLabel ? (
+            <span className="status-pill rounded-full px-3 py-1 text-xs">
+              {activity.retryDelayLabel}
+            </span>
+          ) : null}
           {displayTurn?.phase ? (
             <span className="status-pill rounded-full px-3 py-1 text-xs">
               {formatPhaseName(displayTurn.phase)}
@@ -968,6 +1134,7 @@ function LiveRolePanel({
       {role === "referee" ? (
         <RefereeMilestoneCard
           currentTaskIndex={currentTaskIndex}
+          pendingBatch={pendingBatch}
           previewTaskPlan={previewTaskPlan}
           runStatus={runStatus}
           taskPlan={taskPlan}
@@ -977,6 +1144,22 @@ function LiveRolePanel({
       {statusMessage ? (
         <div className="mt-4 rounded-[1.1rem] border border-[var(--line)] bg-white/75 p-4 text-sm text-[var(--ink-soft)]">
           {statusMessage}
+        </div>
+      ) : null}
+      {liveTurn?.lastError ? (
+        <div className="mt-4 rounded-[1.1rem] border border-amber-200 bg-amber-50/80 p-4 text-sm text-amber-800">
+          Previous attempt failed: {liveTurn.lastError}
+          {typeof liveTurn.retryDelayMs === "number"
+            ? ` Retrying ${
+                liveTurn.attempt && liveTurn.maxAttempts
+                  ? `attempt ${liveTurn.attempt} of ${liveTurn.maxAttempts}`
+                  : "shortly"
+              }${
+                liveTurn.retryDelayMs > 0
+                  ? ` after ${Math.ceil(liveTurn.retryDelayMs / 1000)}s of backoff.`
+                  : "."
+              }`
+            : ""}
         </div>
       ) : null}
 
@@ -989,7 +1172,8 @@ function LiveRolePanel({
           <ThinkingState
             detail={activity.detail}
             phase={liveTurn.phase}
-            role={role}
+            roleLabel={roleLabel}
+            stateLabel={activity.label}
           />
         ) : displayTurn ? (
           role === "referee" && displayTurn.phase === "planning" && !previewTaskPlan ? (
@@ -1012,6 +1196,44 @@ function LiveRolePanel({
         )}
       </div>
 
+      {role !== "referee" ? (
+        <div className="mt-4 grid gap-3 xl:grid-cols-2">
+          <div className="rounded-[1.1rem] border border-[var(--line)] bg-white/75 p-4">
+            <div className="eyebrow">Evidence gathered here</div>
+            <div className="mt-2 text-sm font-medium text-[var(--ink-soft)]">
+              Cycle {currentMilestoneTurn + 1} of {maxMilestoneTurns}
+            </div>
+            {evidenceSources.length ? (
+              <ul className="mt-3 space-y-2 text-sm leading-6 text-[var(--foreground)]">
+                {evidenceSources.slice(0, 4).map((source) => (
+                  <li key={source.id}>{source.title}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-3 text-sm leading-6 text-[var(--ink-soft)]">
+                No structured sources gathered on this visible turn.
+              </p>
+            )}
+          </div>
+          <div className="rounded-[1.1rem] border border-[var(--line)] bg-white/75 p-4">
+            <div className="eyebrow">
+              {sharedEvidenceLabel ? `Shared evidence from ${sharedEvidenceLabel}` : "Shared evidence"}
+            </div>
+            {sharedEvidenceSources.length ? (
+              <ul className="mt-3 space-y-2 text-sm leading-6 text-[var(--foreground)]">
+                {sharedEvidenceSources.slice(0, 4).map((source) => (
+                  <li key={source.id}>{source.title}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-3 text-sm leading-6 text-[var(--ink-soft)]">
+                No handoff evidence is visible for this milestone yet.
+              </p>
+            )}
+          </div>
+        </div>
+      ) : null}
+
       {displayTurn ? (
         <div className="mt-4">
           <CopyButtons
@@ -1032,6 +1254,7 @@ function TranscriptCard({
   phase,
   refereeDecision,
   role,
+  roleLabel,
   runStatus,
   sources,
 }: {
@@ -1042,6 +1265,7 @@ function TranscriptCard({
   phase: TurnPhase;
   refereeDecision?: RefereeDecisionViewModel | null;
   role: ActorRole;
+  roleLabel: string;
   runStatus: RunDetail["status"];
   sources?: SourceRecord[];
 }) {
@@ -1059,7 +1283,7 @@ function TranscriptCard({
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-3">
-          <span className="status-pill rounded-full px-3 py-1 text-xs">{role}</span>
+          <span className="status-pill rounded-full px-3 py-1 text-xs">{roleLabel}</span>
           <span className="status-pill rounded-full px-3 py-1 text-xs">{phase}</span>
           {isLive ? (
             <span className="status-pill rounded-full px-3 py-1 text-xs">
@@ -1135,6 +1359,7 @@ export function RunSession({ initialRun }: RunSessionProps) {
     run.questionBatches.find(
       (batch) => batch.id === run.activeQuestionBatchId && batch.status === "pending",
     ) ?? null;
+  const roleLabels = getRoleLabels(run);
 
   useEffect(() => {
     setStepIndex(0);
@@ -1164,10 +1389,15 @@ export function RunSession({ initialRun }: RunSessionProps) {
   const upsertLiveTurn = useEffectEvent(
     (payload: {
       at: string;
+      attempt?: number;
       content: string;
+      lastError?: string | null;
+      maxAttempts?: number;
       modelId: string;
       phase: TurnPhase;
+      retryDelayMs?: number | null;
       role: ActorRole;
+      startedAt?: string;
       turnIndex: number;
       updatedAt: string;
     }) => {
@@ -1176,11 +1406,15 @@ export function RunSession({ initialRun }: RunSessionProps) {
       setLiveTurns((existing) => ({
         ...existing,
         [key]: {
+          attempt: payload.attempt,
           content: payload.content,
+          lastError: payload.lastError ?? null,
+          maxAttempts: payload.maxAttempts,
           modelId: payload.modelId,
           phase: payload.phase,
+          retryDelayMs: payload.retryDelayMs ?? null,
           role: payload.role,
-          startedAt: existing[key]?.startedAt ?? payload.at,
+          startedAt: payload.startedAt ?? existing[key]?.startedAt ?? payload.at,
           turnIndex: payload.turnIndex,
           updatedAt: payload.updatedAt,
         },
@@ -1226,12 +1460,36 @@ export function RunSession({ initialRun }: RunSessionProps) {
         const startedEvent = payload as Extract<RunEvent, { type: "turn_started" }>;
         upsertLiveTurn({
           at: startedEvent.at,
+          attempt: startedEvent.attempt,
           content: "",
+          lastError: null,
+          maxAttempts: startedEvent.maxAttempts,
           modelId: startedEvent.modelId,
           phase: startedEvent.phase,
+          retryDelayMs: null,
           role: startedEvent.role,
+          startedAt: startedEvent.at,
           turnIndex: startedEvent.turnIndex,
           updatedAt: startedEvent.at,
+        });
+        return;
+      }
+
+      if (payload.type === "turn_retrying") {
+        const retryEvent = payload as Extract<RunEvent, { type: "turn_retrying" }>;
+        upsertLiveTurn({
+          at: retryEvent.at,
+          attempt: retryEvent.attempt,
+          content: "",
+          lastError: retryEvent.lastError,
+          maxAttempts: retryEvent.maxAttempts,
+          modelId: retryEvent.modelId,
+          phase: retryEvent.phase,
+          retryDelayMs: retryEvent.retryDelayMs,
+          role: retryEvent.role,
+          startedAt: retryEvent.at,
+          turnIndex: retryEvent.turnIndex,
+          updatedAt: retryEvent.at,
         });
         return;
       }
@@ -1240,9 +1498,13 @@ export function RunSession({ initialRun }: RunSessionProps) {
         const deltaEvent = payload as Extract<RunEvent, { type: "turn_delta" }>;
         upsertLiveTurn({
           at: deltaEvent.at,
+          attempt: deltaEvent.attempt,
           content: deltaEvent.content,
+          lastError: null,
+          maxAttempts: deltaEvent.maxAttempts,
           modelId: deltaEvent.modelId,
           phase: deltaEvent.phase,
+          retryDelayMs: null,
           role: deltaEvent.role,
           turnIndex: deltaEvent.turnIndex,
           updatedAt: deltaEvent.at,
@@ -1319,9 +1581,28 @@ export function RunSession({ initialRun }: RunSessionProps) {
   const latestParticipantATurn = latestPersistedTurn(run.turns, "participant_a");
   const latestParticipantBTurn = latestPersistedTurn(run.turns, "participant_b");
   const latestRefereeTurn = latestPersistedTurn(run.turns, "referee");
+  const participantAEvidenceTurn = latestEvidenceTurnForRole({
+    role: "participant_a",
+    run,
+    sourcesByTurn,
+  });
+  const participantBEvidenceTurn = latestEvidenceTurnForRole({
+    role: "participant_b",
+    run,
+    sourcesByTurn,
+  });
+  const participantAEvidenceSources = participantAEvidenceTurn
+    ? sourcesByTurn.get(participantAEvidenceTurn.id) ?? []
+    : [];
+  const participantBEvidenceSources = participantBEvidenceTurn
+    ? sourcesByTurn.get(participantBEvidenceTurn.id) ?? []
+    : [];
   const participantAStats = countParticipantOutputs(run.turns, "participant_a");
   const participantBStats = countParticipantOutputs(run.turns, "participant_b");
   const refereeStats = countRefereeOutputs(run.turns);
+  const participantAOutputLabels = getDebateOutputLabels(run.debateMode, "participant_a");
+  const participantBOutputLabels = getDebateOutputLabels(run.debateMode, "participant_b");
+  const refereeOutputLabels = getDebateOutputLabels(run.debateMode, "referee");
 
   async function cancelRun() {
     setError(null);
@@ -1403,6 +1684,9 @@ export function RunSession({ initialRun }: RunSessionProps) {
               <span className="status-pill rounded-full px-4 py-2 text-sm">
                 {run.status}
               </span>
+              <span className="status-pill rounded-full px-4 py-2 text-sm">
+                {getDebateModeLabel(run.debateMode)}
+              </span>
               {run.stopReason ? (
                 <span className="status-pill rounded-full px-4 py-2 text-sm">
                   stop: {run.stopReason}
@@ -1417,15 +1701,15 @@ export function RunSession({ initialRun }: RunSessionProps) {
             </p>
             <div className="mt-6 grid gap-3 text-sm text-[var(--ink-soft)] md:grid-cols-3">
               <div className="rounded-[1.2rem] border border-[var(--line)] bg-white/55 p-4">
-                <div className="eyebrow">Participants</div>
+                <div className="eyebrow">Active roles</div>
                 <div className="mt-2 leading-7">
-                  {run.participantA.modelId}
+                  {roleLabels.participant_a}: {run.participantA.modelId}
                   <br />
-                  {run.participantB.modelId}
+                  {roleLabels.participant_b}: {run.participantB.modelId}
                 </div>
               </div>
               <div className="rounded-[1.2rem] border border-[var(--line)] bg-white/55 p-4">
-                <div className="eyebrow">Referee</div>
+                <div className="eyebrow">{roleLabels.referee}</div>
                 <div className="mt-2 leading-7">{run.referee.modelId}</div>
               </div>
               <div className="rounded-[1.2rem] border border-[var(--line)] bg-white/55 p-4">
@@ -1447,7 +1731,16 @@ export function RunSession({ initialRun }: RunSessionProps) {
                 <div className="mt-1 text-3xl font-semibold">{run.currentTurn + 1}</div>
               </div>
               <div>
-                <div className="text-sm text-[var(--ink-soft)]">Max cycles</div>
+                <div className="text-sm text-[var(--ink-soft)]">Milestone cycle</div>
+                <div className="mt-1 text-3xl font-semibold">
+                  {run.currentMilestoneTurn + 1}
+                  <span className="ml-2 text-sm font-medium text-[var(--ink-soft)]">
+                    of {run.maxTurns}
+                  </span>
+                </div>
+              </div>
+              <div>
+                <div className="text-sm text-[var(--ink-soft)]">Max cycles per milestone</div>
                 <div className="mt-1 text-3xl font-semibold">{run.maxTurns}</div>
               </div>
             </div>
@@ -1498,6 +1791,9 @@ export function RunSession({ initialRun }: RunSessionProps) {
         <section className="grid gap-6 xl:grid-cols-5">
           <MilestoneOverviewCard
             currentTaskIndex={run.currentTaskIndex}
+            currentMilestoneTurn={run.currentMilestoneTurn}
+            maxMilestoneTurns={run.maxTurns}
+            pendingBatch={pendingBatch}
             runStatus={run.status}
             taskPlan={displayTaskPlan}
           />
@@ -1506,11 +1802,12 @@ export function RunSession({ initialRun }: RunSessionProps) {
             liveTurn={participantALiveTurn}
             modelId={run.participantA.modelId}
             now={now}
-            primaryLabel="Proposal or revision"
+            primaryLabel={participantAOutputLabels.primary}
             primaryValue={participantAStats.proposalLike}
-            role="participant_a"
+            roleLabel={roleLabels.participant_a}
+            roleTestId="participant_a"
             runStatus={run.status}
-            secondaryLabel="Critiques"
+            secondaryLabel={participantAOutputLabels.secondary}
             secondaryValue={participantAStats.critiques}
           />
           <RoleSummaryCard
@@ -1518,11 +1815,12 @@ export function RunSession({ initialRun }: RunSessionProps) {
             liveTurn={participantBLiveTurn}
             modelId={run.participantB.modelId}
             now={now}
-            primaryLabel="Proposal or revision"
+            primaryLabel={participantBOutputLabels.primary}
             primaryValue={participantBStats.proposalLike}
-            role="participant_b"
+            roleLabel={roleLabels.participant_b}
+            roleTestId="participant_b"
             runStatus={run.status}
-            secondaryLabel="Critiques"
+            secondaryLabel={participantBOutputLabels.secondary}
             secondaryValue={participantBStats.critiques}
           />
           <RoleSummaryCard
@@ -1530,11 +1828,12 @@ export function RunSession({ initialRun }: RunSessionProps) {
             liveTurn={refereeLiveTurn}
             modelId={run.referee.modelId}
             now={now}
-            primaryLabel="Planning passes"
+            primaryLabel={refereeOutputLabels.primary}
             primaryValue={refereeStats.planning}
-            role="referee"
+            roleLabel={roleLabels.referee}
+            roleTestId="referee"
             runStatus={run.status}
-            secondaryLabel="Evaluations"
+            secondaryLabel={refereeOutputLabels.secondary}
             secondaryValue={refereeStats.evaluations}
           />
         </section>
@@ -1542,39 +1841,59 @@ export function RunSession({ initialRun }: RunSessionProps) {
         <section className="grid gap-6 xl:grid-cols-3">
           <LiveRolePanel
             currentTaskIndex={run.currentTaskIndex}
+            currentMilestoneTurn={run.currentMilestoneTurn}
+            evidenceSources={participantAEvidenceSources}
             latestDecision={latestDecision}
             liveTurn={participantALiveTurn}
+            maxMilestoneTurns={run.maxTurns}
             modelId={run.participantA.modelId}
             now={now}
             role="participant_a"
+            roleLabel={roleLabels.participant_a}
             runStatus={run.status}
+            sharedEvidenceLabel={roleLabels.participant_b}
+            sharedEvidenceSources={participantBEvidenceSources}
             statusMessage={null}
             taskPlan={displayTaskPlan}
             turn={latestParticipantATurn}
+            pendingBatch={pendingBatch}
           />
           <LiveRolePanel
             currentTaskIndex={run.currentTaskIndex}
+            currentMilestoneTurn={run.currentMilestoneTurn}
+            evidenceSources={participantBEvidenceSources}
             latestDecision={latestDecision}
             liveTurn={participantBLiveTurn}
+            maxMilestoneTurns={run.maxTurns}
             modelId={run.participantB.modelId}
             now={now}
             role="participant_b"
+            roleLabel={roleLabels.participant_b}
             runStatus={run.status}
+            sharedEvidenceLabel={roleLabels.participant_a}
+            sharedEvidenceSources={participantAEvidenceSources}
             statusMessage={null}
             taskPlan={displayTaskPlan}
             turn={latestParticipantBTurn}
+            pendingBatch={pendingBatch}
           />
           <LiveRolePanel
             currentTaskIndex={run.currentTaskIndex}
+            currentMilestoneTurn={run.currentMilestoneTurn}
+            evidenceSources={[]}
             latestDecision={latestDecision}
             liveTurn={refereeLiveTurn}
+            maxMilestoneTurns={run.maxTurns}
             modelId={run.referee.modelId}
             now={now}
             role="referee"
+            roleLabel={roleLabels.referee}
             runStatus={run.status}
+            sharedEvidenceSources={[]}
             statusMessage={statusMessage}
             taskPlan={displayTaskPlan}
             turn={latestRefereeTurn}
+            pendingBatch={pendingBatch}
           />
         </section>
 
@@ -1670,6 +1989,7 @@ export function RunSession({ initialRun }: RunSessionProps) {
                     phase={item.turn.phase}
                     refereeDecision={item.kind === "persisted" ? persistedDecision : liveDecision}
                     role={item.turn.role}
+                    roleLabel={roleLabels[item.turn.role]}
                     runStatus={run.status}
                     sources={
                       item.kind === "persisted"

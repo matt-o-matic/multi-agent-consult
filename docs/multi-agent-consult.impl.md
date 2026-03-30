@@ -1,6 +1,19 @@
 # Multi-Agent Consult Implementation Log
 
 ## Decisions
+- 2026-03-30 12:16 EDT: Shifted transient model failures to an attempt-level concern instead of a run-level concern by adding a shared chat retry runner with a fixed three-attempt budget, bounded backoff, and `Retry-After` support.
+- 2026-03-30 12:16 EDT: Standardized provider failure handling around typed `ProviderChatError` classification so OpenRouter transport failures, retryable HTTP statuses, SSE truncation, empty streamed completions, and stream-liveness timeouts can be retried consistently while auth/config/cancellation errors fail fast.
+- 2026-03-30 12:16 EDT: Chose a narrow structured-output repair path for planning and referee JSON stages: one schema-repair retry inside the normal attempt budget, without retrying coordinator invariants or persisting failed attempts.
+- 2026-03-30 11:44 EDT: Normalized alternate question field names like `prompt`, `title`, `header`, and `text` into canonical `question` text for both referee-issued question batches and participant `propose_user_questions` payloads, so near-miss model JSON no longer fails or gets silently dropped.
+- 2026-03-30 11:08 EDT: Reinterpreted `maxTurns` as a per-milestone cycle cap instead of a whole-run cap, while keeping the public run payload shape unchanged and adding only `currentMilestoneTurn` as new persisted run state.
+- 2026-03-30 11:08 EDT: Chose deterministic evidence handoff over model-authored research summaries. Participant tool outputs and source records are now condensed into structured milestone-local evidence packets and injected into the other participant's next turn plus the referee evaluation prompt.
+- 2026-03-30 11:08 EDT: Tightened planner, participant, and referee prompts toward stage-preserving milestone plans, current-milestone-only focus, good-enough advancement, and explicit blocking vs carry-forward vs diminishing-return classifications.
+- 2026-03-30 10:02 EDT: Replaced the six-exchange participant tool ceiling with a much larger internal backstop so research-heavy turns can keep using tools without failing mid-thought, while still preserving a hard stop for genuinely broken loops.
+- 2026-03-30 11:20 EDT: Removed the three-question clarification cap from both referee question batches and participant question proposals; clarification flow now accepts as many user questions as the run materially needs.
+- 2026-03-30 11:20 EDT: Made question-batch parsing tolerant of plain string options by normalizing them into full option objects at persistence time instead of failing the run on strict schema mismatches.
+- 2026-03-27 14:00 EDT: Added persisted debate modes with `collaborative_debate` as the default and `writers_room` as a first alternate mode, while keeping the provider and participant config shapes intact.
+- 2026-03-27 14:00 EDT: Allowed the referee's planning pass to pause for clarification before a task plan exists; planning now returns either milestones or a `questionBatch`, never an implicit fallback milestone list.
+- 2026-03-27 14:00 EDT: Centralized role naming and output-label copy so the builder and run page can relabel Participant A/B as Writer/Editor without introducing a separate participant schema.
 - 2026-03-26 15:56 EDT: Scaffolded the project with Next.js App Router, TypeScript, Tailwind, ESLint, and `npm`.
 - 2026-03-26 15:57 EDT: Persisted the agreed delivery plan into `docs/multi-agent-consult.plan.md`.
 - 2026-03-26 16:02 EDT: Chose Drizzle + `better-sqlite3` with app-driven table initialization so the local app can boot without a manual migration step.
@@ -31,6 +44,21 @@
 - 2026-03-26 23:39 EDT: Replaced the OpenRouter adapter's fixed four-minute wall-clock timeout with stream-liveness timeouts: 60 seconds to first streamed activity and 30 seconds of idle time between streamed events.
 
 ## Progress
+- 2026-03-30 12:16 EDT: Added `ProviderChatError` primitives, a shared `executeChatWithRetry(...)` runner, and OpenRouter failure classification so planning turns, participant turns, referee evaluations, and provider-native search now retry transient failures in place instead of failing the whole run immediately.
+- 2026-03-30 12:16 EDT: Added structured-output repair retries for planning and referee JSON responses, wired retry attempt/backoff metadata into SSE live state, and updated the run UI to show attempt counts, retrying state, and last-attempt failure messages while a lane stays active.
+- 2026-03-30 12:16 EDT: Added provider, coordinator, web-tool, live-state, and run-session regression coverage for retryable timeouts, retryable provider failures, malformed JSON repair, and retry status rendering.
+- 2026-03-30 11:44 EDT: Hardened clarification parsing against alternate question field names, added a coordinator regression for referee `questionBatch` alias normalization, and added a tool-broker regression for participant `propose_user_questions` alias normalization.
+- 2026-03-30 11:08 EDT: Added `current_milestone_turn` plus richer referee-decision JSON columns to SQLite bootstrap and persistence, including backward-compatible column creation for already-initialized local databases.
+- 2026-03-30 11:08 EDT: Reworked the coordinator so each milestone gets its own cycle budget, non-final milestones advance after exhausting that budget, and resume state reconstructs milestone-local drafts, critiques, prior carry-forward notes, and evidence packets from persisted artifacts.
+- 2026-03-30 11:08 EDT: Updated the run page and builder copy to surface milestone-local cycle counts, structured referee blocking/carry-forward/diminishing-return sections, and visible evidence handoff between the participant lanes.
+- 2026-03-30 11:08 EDT: Added coordinator regressions for per-milestone caps and editor-to-writer evidence handoff, plus prompt and run-session coverage for the new prompt wording and UI readout.
+- 2026-03-30 10:02 EDT: Raised the participant tool-loop guardrail to 64 assistant/tool exchanges per turn and added coordinator regression coverage for a participant turn that uses seven consecutive tool exchanges before returning its draft.
+- 2026-03-30 11:20 EDT: Relaxed `questionBatch` parsing in the coordinator, removed the answer-route max length, and updated prompt copy so planner and referee prompts no longer tell models they only get three clarification questions.
+- 2026-03-30 11:20 EDT: Removed the `propose_user_questions` hard cap, normalized loose participant question proposals, and expanded coordinator regression coverage to include five-question clarification batches with plain-string options.
+- 2026-03-27 14:00 EDT: Added `debateMode` through validation, persistence, retry reconstruction, builder local settings, and run summaries/details with backward-compatible defaulting for historical runs.
+- 2026-03-27 14:00 EDT: Refactored the coordinator around a mode registry, added planner question-batch support before milestones exist, and implemented the Writer/Editor cycle alongside the existing collaborative cycle.
+- 2026-03-27 14:00 EDT: Updated prompts to make question-first behavior explicit for planner, participants, and referee, plus mode-specific Writer/Editor instructions and referee constraints.
+- 2026-03-27 14:00 EDT: Updated the builder and run page to show mode badges, mode-aware role labels, planning wait states, and mode-aware per-role output labels.
 - 2026-03-26 15:56 EDT: Created the baseline Next.js application in an empty workspace.
 - 2026-03-26 15:57 EDT: Created the implementation log and initial documentation scaffolding.
 - 2026-03-26 16:03 EDT: Added runtime dependencies, test tooling, environment contract, and repo scripts.
@@ -60,6 +88,8 @@
 - 2026-03-26 23:39 EDT: Added OpenRouter adapter tests covering first-activity timeout, post-start idle timeout, non-text activity keepalive, explicit cancellation, and long-running streams that legitimately exceed four minutes.
 
 ## Gaps
+- Builder defaults remain browser-local. Debate mode now persists there too, but settings still do not sync across browsers or machines.
+- Historical runs created before `debateMode` was added are treated as `collaborative_debate` on read; they are not backfilled in storage.
 - Active runs are process-local. If the server restarts while a run is `waiting_for_user`, the persisted transcript remains, but that in-flight run will not automatically resume.
 - Provider-native web-search support is inferred from OpenRouter metadata and enforced at validation time, but individual model/provider combinations may still fail at runtime if upstream capabilities change.
 - Final citations are aggregated from collected source records rather than model-selected per-sentence citations. The output keeps sources separated from the solution body, but it does not attempt sentence-level attribution.
@@ -74,6 +104,14 @@
 - None currently.
 
 ## Verification
+- 2026-03-30 12:16 EDT: `npm run test -- tests/openrouter-provider.test.ts tests/debate-coordinator.test.ts tests/run-session.test.tsx tests/web-tools.test.ts tests/live-state.test.ts tests/tool-broker.test.ts` passed after adding provider error classification, in-run retries, structured-output repair retries, and retry-state UI coverage.
+- 2026-03-30 12:16 EDT: `npm run test` passed with 48 tests after wiring automatic in-run retries through provider, coordinator, web-tool, live-state, and UI layers.
+- 2026-03-30 12:16 EDT: `npm run lint` passed after the retry runner, typed provider errors, and retry-status UI changes.
+- 2026-03-30 12:16 EDT: `npm run build` passed after integrating attempt metadata into the SSE path and run-session live lanes.
+- 2026-03-30 10:59 EDT: `npm run test -- tests/debate-prompts.test.ts tests/debate-coordinator.test.ts tests/run-session.test.tsx tests/dashboard.test.tsx` passed after the milestone-local cycle refactor, evidence handoff injection, and run-page status updates.
+- 2026-03-27 13:59 EDT: `npm run test` passed with 31 tests after adding mode-aware coordinator coverage, planner-question retry coverage, prompt coverage, and UI rendering checks for Writer/Editor labels.
+- 2026-03-27 13:59 EDT: `npm run lint` passed after wiring `debateMode` through the builder, run page, persistence layer, and coordinator.
+- 2026-03-27 13:59 EDT: `npm run build` passed after the mode-aware orchestration refactor, planning-question support, and UI label changes.
 - 2026-03-26 15:56 EDT: `npm create next-app@latest . -- --ts --tailwind --eslint --app --use-npm --yes --import-alias "@/*"` completed successfully.
 - 2026-03-26 16:25 EDT: `npm run lint` passed after server, route, and UI integration.
 - 2026-03-26 16:27 EDT: `npm run build` passed, confirming the Next.js production build, typecheck, and route compilation.
